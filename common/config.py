@@ -49,6 +49,11 @@ class FMConfig:
     # 采样
     sample_steps: int = 100
     sample_method: str = "euler"  # euler / rk4
+    # 时间加权
+    time_weight_mode: str = "mid"   # none / mid / late / early
+    time_weight_scale: float = 1.0  # 加权幅度缩放
+    # EMA loss
+    ema_loss_alpha: float = 0.1    # loss EMA 平滑系数
 
 
 # ────────────────────────────────────────────────────────────
