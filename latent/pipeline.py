@@ -66,10 +66,10 @@ class LatentPipeline:
         times = []
 
         for enc in encoded:
-            part_dict = {k: v.unsqueeze(0).to(self.device) for k, v in enc.items() if k.endswith('_emb')}
+            part_dict = {k: v.unsqueeze(0).float().to(self.device) for k, v in enc.items() if k.endswith('_emb')}
             fused = self.fusion.forward_from_dict(part_dict).squeeze(0).cpu()
             fused_embs.append(fused)
-            section_embs.append({k: v.cpu() for k, v in part_dict.items()})
+            section_embs.append({k: v.cpu().float() for k, v in part_dict.items()})
             times.append(enc['time'])
 
         return {
@@ -126,7 +126,7 @@ class LatentPipeline:
             embs = self.embedder.encode_texts(
                 section_texts[name], show_progress=False, desc=f"[Emb] {name}"
             )
-            section_embs[name] = embs.to(self.device)
+            section_embs[name] = embs.float().to(self.device)
 
         # 注意力融合
         batch_size = len(sections)
