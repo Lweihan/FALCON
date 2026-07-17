@@ -26,6 +26,7 @@ env/
 
 # ── Model / Checkpoint outputs ──────────────
 output/
+configs/falcon_config.yaml
 checkpoints/
 *.pt
 *.ckpt
