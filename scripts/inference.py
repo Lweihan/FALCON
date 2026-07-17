@@ -51,6 +51,12 @@ def fm_inference(args):
         hidden_dim=config.fm.hidden_dim,
         num_layers=config.fm.num_layers,
         dropout=0.0,
+        backbone_type=config.fm.backbone_type,
+        transformer_dim=config.fm.transformer_dim,
+        transformer_depth=config.fm.transformer_depth,
+        transformer_heads=config.fm.transformer_heads,
+        transformer_mlp_ratio=config.fm.transformer_mlp_ratio,
+        transformer_dropout=0.0,
     ).to(device)
 
     ckpt = torch.load(args.fm_checkpoint, map_location=device)

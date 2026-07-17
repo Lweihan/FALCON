@@ -4,7 +4,8 @@ fm — Flow Matching 模块 (Teacher)
 基于 Flow Matching 的用户特征预测模型，作为 OPD 的 Teacher。
 """
 
-__all__ = ['flow_match_forward', 'VelocityNetwork', 'FlowMatchingModel', 'FMTrainer']
+__all__ = ['flow_match_forward', 'VelocityNetwork', 'TransformerVelocityNetwork',
+           'FlowMatchingModel', 'FMTrainer']
 
 
 def __getattr__(name):
@@ -14,6 +15,9 @@ def __getattr__(name):
     elif name == 'VelocityNetwork':
         from .velocity_net import VelocityNetwork
         return VelocityNetwork
+    elif name == 'TransformerVelocityNetwork':
+        from .velocity_net import TransformerVelocityNetwork
+        return TransformerVelocityNetwork
     elif name == 'FlowMatchingModel':
         from .model import FlowMatchingModel
         return FlowMatchingModel

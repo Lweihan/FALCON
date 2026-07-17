@@ -36,9 +36,18 @@ class FMConfig:
     data_dim: int = 256           # 数据维度 (= LatentConfig.fusion_output_dim)
     time_dim: int = 128          # 时间编码维度
     cond_dim: int = 256          # 条件维度 (= data_dim)
-    hidden_dim: int = 512        # Velocity Net 隐藏维度
-    num_layers: int = 6          # Velocity Net 层数
+    # Backbone 选择
+    backbone_type: str = "transformer"  # transformer / mlp
+    # MLP backbone 参数
+    hidden_dim: int = 512        # MLP 隐藏维度
+    num_layers: int = 6          # MLP 层数
     dropout: float = 0.1
+    # Transformer backbone 参数
+    transformer_dim: int = 1024       # Transformer 隐藏维度
+    transformer_depth: int = 8        # Transformer 层数
+    transformer_heads: int = 8        # 注意力头数
+    transformer_mlp_ratio: float = 4.0  # FFN 扩展比例
+    transformer_dropout: float = 0.1
     # 训练
     epochs: int = 100
     batch_size: int = 32

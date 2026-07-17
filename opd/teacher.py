@@ -45,9 +45,17 @@ class FMTeacher:
             data_dim=fm_config.data_dim,
             time_dim=fm_config.time_dim,
             cond_dim=fm_config.cond_dim,
+            # MLP 参数
             hidden_dim=fm_config.hidden_dim,
             num_layers=fm_config.num_layers,
             dropout=0.0,  # 推理不用 dropout
+            # Transformer 参数
+            backbone_type=fm_config.backbone_type,
+            transformer_dim=fm_config.transformer_dim,
+            transformer_depth=fm_config.transformer_depth,
+            transformer_heads=fm_config.transformer_heads,
+            transformer_mlp_ratio=fm_config.transformer_mlp_ratio,
+            transformer_dropout=0.0,  # 推理不用 dropout
         ).to(device)
 
         # 加载 checkpoint

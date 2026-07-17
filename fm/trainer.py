@@ -35,13 +35,26 @@ class FMTrainer:
             data_dim=config.data_dim,
             time_dim=config.time_dim,
             cond_dim=config.cond_dim,
+            # MLP 参数
             hidden_dim=config.hidden_dim,
             num_layers=config.num_layers,
             dropout=config.dropout,
+            # Transformer 参数
+            backbone_type=config.backbone_type,
+            transformer_dim=config.transformer_dim,
+            transformer_depth=config.transformer_depth,
+            transformer_heads=config.transformer_heads,
+            transformer_mlp_ratio=config.transformer_mlp_ratio,
+            transformer_dropout=config.transformer_dropout,
         ).to(device)
 
-        logger.info(f"FM Teacher 参数量: {count_parameters(self.model):,}")
-        logger.info(f"  时间加权策略: {config.time_weight_mode}, scale={config.time_weight_scale}")
+        total_params = count_parameters(self.model)
+        vel_params = count_parameters(self.model.velocity_net)
+        logger.info(f"FM Teacher 初始化:")
+        logger.info(f"  Backbone: {config.backbone_type}")
+        logger.info(f"  总参数量: {total_params:,}")
+        logger.info(f"  速度网络参数量: {vel_params:,}")
+        logger.info(f"  时间加权: mode={config.time_weight_mode}, scale={config.time_weight_scale}")
         logger.info(f"  EMA loss alpha: {config.ema_loss_alpha}")
 
     def train(
@@ -57,6 +70,11 @@ class FMTrainer:
         tb_dir = os.path.join(output_dir, 'tensorboard')
         writer = SummaryWriter(log_dir=tb_dir)
         logger.info(f"TensorBoard 日志目录: {tb_dir}")
+
+        # 记录元信息
+        writer.add_text('meta/backbone_type', self.config.backbone_type, 0)
+        writer.add_scalar('meta/param_count_total', count_parameters(self.model), 0)
+        writer.add_scalar('meta/param_count_velocity_net', count_parameters(self.model.velocity_net), 0)
 
         train_loader = create_dataloader(data_dir, batch_size=self.config.batch_size,
                                           split='train', train_ratio=train_ratio)
@@ -133,7 +151,7 @@ class FMTrainer:
                 'lr': lr,
             })
 
-            # 用 EMA val loss 判断最佳模型 (更稳定)
+            # 用 EMA val loss 判断最佳模型
             if ema_val_loss < best_val:
                 best_val = ema_val_loss
                 save_checkpoint(
@@ -218,7 +236,7 @@ class FMTrainer:
             )
             total_loss += loss_dict['mse_raw']
 
-            # 额外计算 cosine similarity
+            # cosine similarity
             pred = self.model.predict_future_embedding(cond, delta_t=0.5, num_steps=50)
             cos = F.cosine_similarity(pred, x_clean, dim=-1).mean().item()
             total_cos += cos
