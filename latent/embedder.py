@@ -36,20 +36,53 @@ class ProfileEmbedder:
         self.device = device
 
         logger.info(f"加载 Embedding 模型: {model_path} → {device}")
-        try:
-            self.tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side='left')
-        except ValueError:
-            # Qwen3 系列需要 tiktoken；若未安装则回退到 slow tokenizer
-            logger.warning("Fast tokenizer 加载失败，尝试 use_fast=False (请安装 tiktoken 以加速)")
-            self.tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side='left', use_fast=False)
-        try:
-            self.model = AutoModel.from_pretrained(
-                model_path, torch_dtype=torch.float16, attn_implementation="flash_attention_2"
-            ).to(device)
-        except Exception:
-            self.tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side='left')
-            self.model = AutoModel.from_pretrained(model_path, torch_dtype=torch.float16).to(device)
-            logger.warning("Flash Attention 2 不可用，使用默认 attention")
+        # Qwen3 系列tokenizer 加载策略 (需要 tiktoken + trust_remote_code)
+        tokenizer_loaded = False
+        for attempt_opts in [
+            {"padding_side": "left", "trust_remote_code": True},
+            {"padding_side": "left", "trust_remote_code": True, "use_fast": False},
+            {"padding_side": "left"},
+            {"padding_side": "left", "use_fast": False},
+        ]:
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(model_path, **attempt_opts)
+                tokenizer_loaded = True
+                logger.info(f"Tokenizer 加载成功 (opts: {attempt_opts})")
+                break
+            except Exception as e:
+                last_tok_err = e
+                logger.debug(f"Tokenizer 尝试失败 ({attempt_opts}): {e}")
+                continue
+
+        if not tokenizer_loaded:
+            logger.error(
+                "所有 tokenizer 加载方式均失败。请确认:\n"
+                "  1. pip install tiktoken sentencepiece\n"
+                "  2. pip install transformers>=4.40.0\n"
+                "  3. 模型目录完整 (含 tokenizer.json / tokenizer_config.json)"
+            )
+            raise last_tok_err
+
+        # 模型加载
+        model_loaded = False
+        for attempt_opts in [
+            {"torch_dtype": torch.float16, "attn_implementation": "flash_attention_2", "trust_remote_code": True},
+            {"torch_dtype": torch.float16, "trust_remote_code": True},
+            {"torch_dtype": torch.float16},
+        ]:
+            try:
+                self.model = AutoModel.from_pretrained(model_path, **attempt_opts).to(device)
+                model_loaded = True
+                logger.info(f"模型加载成功 (opts: {attempt_opts})")
+                break
+            except Exception as e:
+                last_model_err = e
+                logger.debug(f"模型尝试失败 ({attempt_opts}): {e}")
+                continue
+
+        if not model_loaded:
+            raise last_model_err
+
         self.model.eval()
 
     @torch.no_grad()
