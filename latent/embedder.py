@@ -38,6 +38,11 @@ class ProfileEmbedder:
         logger.info(f"加载 Embedding 模型: {model_path} → {device}")
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side='left')
+        except ValueError:
+            # Qwen3 系列需要 tiktoken；若未安装则回退到 slow tokenizer
+            logger.warning("Fast tokenizer 加载失败，尝试 use_fast=False (请安装 tiktoken 以加速)")
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side='left', use_fast=False)
+        try:
             self.model = AutoModel.from_pretrained(
                 model_path, torch_dtype=torch.float16, attn_implementation="flash_attention_2"
             ).to(device)
