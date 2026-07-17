@@ -12,6 +12,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import get_cosine_schedule_with_warmup
 from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
 
 from common.logger import get_logger
 from common.config import OPDConfig, FMConfig, LatentConfig
@@ -102,6 +103,11 @@ class OPDTrainer:
         """
         os.makedirs(output_dir, exist_ok=True)
 
+        # TensorBoard
+        tb_dir = os.path.join(output_dir, 'tensorboard')
+        writer = SummaryWriter(log_dir=tb_dir)
+        logger.info(f"TensorBoard 日志目录: {tb_dir}")
+
         from scenario.data_loader import create_dataloader
         loader = create_dataloader(data_dir, batch_size=self.config.batch_size, split='train')
 
@@ -162,6 +168,12 @@ class OPDTrainer:
                 n_batches += 1
                 global_step += 1
 
+                # TensorBoard step-level
+                writer.add_scalar('step/total_loss', loss_dict['loss'].item(), global_step)
+                writer.add_scalar('step/emb_loss', loss_dict['emb_loss'].item(), global_step)
+                writer.add_scalar('step/section_loss', loss_dict['section_loss'].item(), global_step)
+                writer.add_scalar('step/kl_loss', loss_dict['kl_loss'].item(), global_step)
+
                 pbar.set_postfix({
                     'loss': f"{loss_dict['loss'].item():.4f}",
                     'emb': f"{loss_dict['emb_loss'].item():.4f}",
@@ -171,6 +183,9 @@ class OPDTrainer:
             avg_loss = epoch_loss / max(n_batches, 1)
             logger.info(f"Epoch {epoch}: avg_loss={avg_loss:.6f}")
 
+            # TensorBoard epoch-level
+            writer.add_scalar('epoch/avg_loss', avg_loss, epoch)
+
             log.append({'epoch': epoch, 'avg_loss': avg_loss, 'global_step': global_step})
 
             if epoch % self.config.save_every == 0:
@@ -179,15 +194,19 @@ class OPDTrainer:
         # 保存最终 LoRA
         self.student.save_lora(os.path.join(output_dir, 'final_lora'))
 
+        writer.close()
         with open(os.path.join(output_dir, 'opd_train_log.json'), 'w') as f:
             json.dump(log, f, indent=2)
         logger.info(f"OPD Offline 训练完成")
+        logger.info(f"查看 TensorBoard: tensorboard --logdir {tb_dir}")
 
     def train_online_step(
         self,
         new_user_data: dict,
         optimizer: torch.optim.Optimizer = None,
-    ) -> dict:
+        writer: SummaryWriter = None,
+        global_step: int = 0,
+    ) -> tuple:
         """
         Phase 2: Online Distillation 单步更新。
 
@@ -211,7 +230,7 @@ class OPDTrainer:
         times = user_result['times']
 
         if embeddings.size(0) < 2:
-            return {'status': 'skipped', 'reason': 'insufficient timesteps'}
+            return {'status': 'skipped', 'reason': 'insufficient timesteps'}, global_step
 
         # 取最早作为 condition, 最晚作为 ground truth
         condition = embeddings[0].unsqueeze(0).to(self.device)
@@ -222,7 +241,6 @@ class OPDTrainer:
             teacher_emb = self.teacher.predict_target_embedding(condition, delta_t=0.5)
 
         # 3. Student 生成画像
-        current_text = new_user_data['records'][0] if 'records' in new_user_data else ''
         from latent.xml_structured import record_to_xml
         import json
         current_text = json.dumps(new_user_data['records'][0], ensure_ascii=False) \
@@ -257,22 +275,33 @@ class OPDTrainer:
         # Teacher EMA 更新
         self.teacher.update_ema()
 
-        return {
+        # TensorBoard
+        global_step += 1
+        if writer is not None:
+            writer.add_scalar('online/loss', loss.item(), global_step)
+            writer.add_scalar('online/reward', reward_dict['reward'].mean().item(), global_step)
+            writer.add_scalar('online/emb_reward', reward_dict['emb_reward'].mean().item(), global_step)
+            writer.add_scalar('online/buffer_size', len(self.replay_buffer), global_step)
+
+        result = {
             'status': 'success',
             'loss': loss.item(),
             'reward': reward_dict['reward'].mean().item(),
             'emb_reward': reward_dict['emb_reward'].mean().item(),
             'buffer_size': len(self.replay_buffer),
         }
+        return result, global_step
 
     def train_online_replay(
         self,
         batch_size: int = 4,
         optimizer: torch.optim.Optimizer = None,
-    ) -> dict:
+        writer: SummaryWriter = None,
+        global_step: int = 0,
+    ) -> tuple:
         """从 Replay Buffer 中采样进行在线更新"""
         if len(self.replay_buffer) < batch_size:
-            return {'status': 'skipped', 'reason': 'buffer too small'}
+            return {'status': 'skipped', 'reason': 'buffer too small'}, global_step
 
         if optimizer is None:
             optimizer = AdamW(
@@ -296,8 +325,14 @@ class OPDTrainer:
         loss_dict['loss'].backward()
         optimizer.step()
 
-        return {
+        global_step += 1
+        if writer is not None:
+            writer.add_scalar('online_replay/loss', loss_dict['loss'].item(), global_step)
+            writer.add_scalar('online_replay/emb_loss', loss_dict['emb_loss'].item(), global_step)
+
+        result = {
             'status': 'success',
             'loss': loss_dict['loss'].item(),
             'emb_loss': loss_dict['emb_loss'].item(),
         }
+        return result, global_step
