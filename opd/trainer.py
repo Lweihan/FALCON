@@ -2,6 +2,7 @@
 trainer.py — OPD 训练器
 ========================
 Offline + Online 两阶段训练 Flow Matching → LLM 蒸馏。
++ CF-OPD (Candidate-Filtered Online Policy Distillation) 训练。
 """
 
 import os
@@ -22,6 +23,7 @@ from .teacher import FMTeacher
 from .student import LLMStudent
 from .distillation import OPDLoss, DistillationEngine
 from .reward import DistillationReward, ReplayBuffer
+from .cf_opd import CFOPDEngine, CandidateFilter, DPOloss
 
 logger = get_logger(__name__)
 
@@ -336,3 +338,187 @@ class OPDTrainer:
             'emb_loss': loss_dict['emb_loss'].item(),
         }
         return result, global_step
+
+    # ────────────────────────────────────────────────────────────
+    # CF-OPD (Candidate-Filtered Online Policy Distillation)
+    # ────────────────────────────────────────────────────────────
+
+    def train_cf_opd(
+        self,
+        data_dir: str,
+        output_dir: str,
+        ranker_model: nn.Module = None,
+        cf_config: 'CFOPDConfig' = None,
+    ):
+        """
+        CF-OPD 训练: 候选生成 → ranker 打分筛选 → DPO/KL 学习。
+
+        与原始 OPD 的核心区别:
+          原始 OPD: 单条生成 → 直接对齐 Teacher
+          CF-OPD:  N 条候选 → ranker 打分 → 筛选 → DPO 偏好学习
+
+        流程:
+          1. 加载用户 embedding 序列
+          2. 每个用户:
+             a. LLM 生成 N 条候选小传文本
+             b. 每条 → standardize → encode → fused embedding
+             c. Ranker 打分 (CVR)
+             d. FM Teacher 预测 target embedding
+             e. 组合 reward = w_emb*cos_sim + w_cvr*cvr_score
+             f. 筛选正例/负例
+             g. DPO/KL loss → 更新 LoRA
+        """
+        from common.config import CFOPDConfig
+
+        cf_config = cf_config or self.config  # fallback
+        if not isinstance(cf_config, CFOPDConfig):
+            # 从 OPDConfig 构建 CFOPDConfig (继承参数)
+            cf_config = CFOPDConfig(
+                distill_alpha=self.config.distill_alpha,
+                distill_beta=self.config.distill_beta,
+                distill_gamma=self.config.distill_gamma,
+                lr=self.config.lr,
+                weight_decay=self.config.weight_decay,
+                grad_clip=self.config.grad_clip,
+                warmup_steps=self.config.warmup_steps,
+                epochs=self.config.epochs,
+                batch_size=self.config.batch_size,
+                save_every=self.config.save_every,
+            )
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        # 初始化 CF-OPD Engine
+        cf_engine = CFOPDEngine(
+            student=self.student,
+            teacher=self.teacher,
+            latent_pipeline=self.latent_pipeline,
+            ranker=ranker_model or self._build_default_ranker(cf_config),
+            cf_config=cf_config,
+            opd_loss=self.opd_loss,
+            device=self.device,
+        )
+        cf_engine.save_reference()
+
+        # TensorBoard
+        tb_dir = os.path.join(output_dir, 'tensorboard_cf')
+        writer = SummaryWriter(log_dir=tb_dir)
+        logger.info(f"CF-OPD TensorBoard 日志目录: {tb_dir}")
+
+        from scenario.data_loader import create_dataloader
+        loader = create_dataloader(data_dir, batch_size=cf_config.batch_size, split='train')
+
+        # 优化器
+        optimizer = AdamW(
+            filter(lambda p: p.requires_grad, self.student.model.parameters()),
+            lr=cf_config.lr,
+            weight_decay=cf_config.weight_decay,
+        )
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer, num_warmup_steps=cf_config.warmup_steps,
+            num_training_steps=cf_config.epochs * len(loader),
+        )
+
+        log = []
+        global_step = 0
+
+        for epoch in range(1, cf_config.epochs + 1):
+            logger.info(f"=== CF-OPD Epoch {epoch}/{cf_config.epochs} ===")
+            epoch_loss = 0.0
+            epoch_reward = 0.0
+            epoch_n_pos = 0
+            epoch_n_neg = 0
+            n_batches = 0
+
+            pbar = tqdm(loader, desc=f"CF-OPD Epoch {epoch}")
+            for batch in pbar:
+                condition = batch['condition'].to(self.device)
+                current_texts = batch.get('current_texts', [''] * condition.size(0))
+
+                # CF-OPD step
+                result = cf_engine.cf_opd_step(
+                    current_text=current_texts[0] if current_texts else '',
+                    condition_emb=condition,
+                )
+
+                if result['status'] == 'skipped':
+                    global_step += 1
+                    continue
+
+                loss = result['loss']
+                optimizer.zero_grad()
+                loss.backward()
+                if cf_config.grad_clip > 0:
+                    nn.utils.clip_grad_norm_(
+                        filter(lambda p: p.requires_grad, self.student.model.parameters()),
+                        cf_config.grad_clip,
+                    )
+                optimizer.step()
+                scheduler.step()
+
+                global_step += 1
+                epoch_loss += loss.item()
+                epoch_reward += result['rewards'].mean().item()
+                epoch_n_pos += result['n_pos']
+                epoch_n_neg += result['n_neg']
+                n_batches += 1
+
+                # TensorBoard
+                writer.add_scalar('cf_opd/step_loss', loss.item(), global_step)
+                writer.add_scalar('cf_opd/step_reward', result['rewards'].mean().item(), global_step)
+                writer.add_scalar('cf_opd/n_pos', result['n_pos'], global_step)
+                writer.add_scalar('cf_opd/n_neg', result['n_neg'], global_step)
+                if 'cvr_scores' in result:
+                    writer.add_scalar('cf_opd/avg_cvr', result['cvr_scores'].mean().item(), global_step)
+
+                pbar.set_postfix({
+                    'loss': f"{loss.item():.4f}",
+                    'pos': result['n_pos'],
+                    'neg': result['n_neg'],
+                    'rwd': f"{result['rewards'].mean().item():.3f}",
+                })
+
+            avg_loss = epoch_loss / max(n_batches, 1)
+            avg_reward = epoch_reward / max(n_batches, 1)
+            logger.info(f"CF-OPD Epoch {epoch}: avg_loss={avg_loss:.6f}, "
+                        f"avg_reward={avg_reward:.4f}, "
+                        f"total_pos={epoch_n_pos}, total_neg={epoch_n_neg}")
+
+            log.append({
+                'epoch': epoch,
+                'avg_loss': avg_loss,
+                'avg_reward': avg_reward,
+                'n_pos': epoch_n_pos,
+                'n_neg': epoch_n_neg,
+                'global_step': global_step,
+            })
+
+            if epoch % cf_config.save_every == 0:
+                self.student.save_lora(os.path.join(output_dir, f'cf_lora_epoch_{epoch}'))
+
+        # 保存最终 LoRA
+        final_path = os.path.join(output_dir, 'cf_final_lora')
+        self.student.save_lora(final_path)
+
+        writer.close()
+        with open(os.path.join(output_dir, 'cf_opd_train_log.json'), 'w') as f:
+            json.dump(log, f, indent=2)
+        logger.info(f"CF-OPD 训练完成. LoRA: {final_path}")
+        logger.info(f"查看 TensorBoard: tensorboard --logdir {tb_dir}")
+
+        return {'log': log, 'lora_path': final_path}
+
+    def _build_default_ranker(self, cf_config):
+        """构建默认 ranker (若未提供)"""
+        import torch.nn as nn
+        ranker = nn.Sequential(
+            nn.Linear(cf_config.ranker_input_dim, cf_config.ranker_hidden_dims[0]),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(cf_config.ranker_hidden_dims[0], cf_config.ranker_hidden_dims[1] if len(cf_config.ranker_hidden_dims) > 1 else 64),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(cf_config.ranker_hidden_dims[-1], 1),
+        ).to(self.device)
+        logger.info("CF-OPD: 使用默认 ranker (未训练)")
+        return ranker
