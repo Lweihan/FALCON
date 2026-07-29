@@ -240,6 +240,177 @@ L_kl:      KL(π_θ || π_ref) · τ²                (防止遗忘)
 
 ---
 
+## 训练样本构造策略
+
+### 配对模式 (`fm.pair_mode`)
+
+FM 预训练的输入是「(condition, target) 样本对」，从用户的时间序列 embedding 中构造。
+三种策略可配置切换：
+
+| 模式 | 说明 | T=4 时样本数 | 特点 |
+|------|------|------------|------|
+| **`last_target`** | 随机早期步 → 最后一步 | 1 | 默认；目标固定为最终态 |
+| **`all_pairs`** | 枚举所有 (i,j) i&lt;j | 6 | 数据利用率 100%，覆盖所有时间跨度 |
+| **`adjacent`** | 相邻配对 (i, i+1) | 3 | 只学短期演变 |
+
+```bash
+# 切换到全配对模式 (样本量提升 6 倍)
+python scripts/pretrain.py --stage fm --pair_mode all_pairs
+```
+
+### delta_t 条件注入
+
+**解决的问题**：训练时 Flow Matching 的 `t` 只是噪声插值系数，与用户真实时间跨度无关。
+若不注入 `delta_t`，`e0 → e3`（跨 3 步）和 `e2 → e3`（跨 1 步）在模型看来是完全相同的任务，
+但推理时却用 `delta_t` 控制预测多远的未来——存在训练/推理语义不一致。
+
+**做法**：把真实时间跨度作为额外条件注入网络。
+
+```
+c = time_embed(t) + cond_embed(condition) + delta_t_embed(delta_t)
+```
+
+`delta_t` 计算优先解析真实时间戳，失败则回退到步数比例：
+
+| 配对 | 真实时间差 | delta_t (时间戳) | delta_t (步数) |
+|------|-----------|-----------------|---------------|
+| 0→1 | 12h | 0.231 | 0.333 |
+| 2→3 | 20h | 0.385 | 0.333 |
+| 0→3 | 52h | 1.000 | 1.000 |
+
+时间戳版本能反映真实间隔差异，步数版本无法区分。
+
+关闭方式（退化为旧行为，便于 AB 对比）：
+```bash
+python scripts/pretrain.py --stage fm --no_delta_t_condition
+```
+
+---
+
+## 多卡训练与性能优化
+
+### 多卡训练 (DDP)
+
+使用 `torchrun` 启动，数据并行：
+
+```bash
+# 4 卡训练，每卡 batch=64，全局 batch=256
+torchrun --nproc_per_node=4 scripts/pretrain.py \
+    --stage fm --embedding_dir ./output/embeddings \
+    --batch_size 64
+
+# 也可以直接指定全局 batch，自动换算 per-GPU
+torchrun --nproc_per_node=4 scripts/pretrain.py \
+    --stage fm --embedding_dir ./output/embeddings \
+    --global_batch_size 256
+```
+
+设计要点：
+- `batch_size` 语义明确为 **per-GPU**，日志会打印 `per_gpu / world_size / global`
+- 用 `DistributedDataParallel`（非 `DataParallel`，后者有 GIL 瓶颈）
+- `DistributedSampler` + 每 epoch `set_epoch()` 保证 shuffle 有效
+- 只有 rank 0 写 TensorBoard / 保存 checkpoint / 打印日志
+- loss/metrics 通过 `all_reduce` 跨卡平均后才记录
+- checkpoint 自动剥离 DDP 包装（`unwrap_model`）
+- 单卡直接 `python scripts/pretrain.py` 即可，无需 torchrun
+
+### GPU 利用率优化策略
+
+我们观察到默认配置下 GPU 利用率约 50%，主要有三个瓶颈。以下是对应的优化手段。
+
+#### 瓶颈 1：验证阶段的 ODE 串行求解（影响最大）
+
+验证时要通过 ODE 求解预测未来 embedding，这个过程是**严格串行迭代**的：
+
+```python
+for step in range(num_steps):       # 50 次串行前向
+    v = velocity_net(x_t, t, cond)  # 每次都要等上一步结果
+    x_t = x_t - v * dt
+```
+
+GPU 在这期间无法并行，且每次前向的 batch 很小，kernel launch 开销占比高。
+
+| 配置项 | 默认 | 作用 |
+|--------|------|------|
+| `val_ode_steps` | **10** | 验证 ODE 步数（原 50）。验证只为看趋势，不需要高精度 |
+| `val_every` | 1 | 每 N epoch 才验证一次 |
+| `val_max_batches` | -1 | 限制验证只跑前 N 个 batch |
+| `val_compute_cos_sim` | true | 设 false 则**完全跳过 ODE**，验证瞬间完成 |
+
+```bash
+# 激进优化: 每 5 epoch 验证一次，且不跑 ODE
+python scripts/pretrain.py --stage fm --val_every 5 --no_val_cos_sim
+```
+
+#### 瓶颈 2：数据加载单线程
+
+原实现 `num_workers=0`，且 `__init__` 一次性把所有 `.pt` 加载进内存，
+CPU 单线程喂数据导致 GPU 饿着。
+
+| 配置项 | 默认 | 作用 |
+|--------|------|------|
+| `num_workers` | **4** | 并行 IO 进程数，建议 4-8 |
+| `lazy_load` | **true** | 懒加载 `.pt`，让 IO 在 worker 进程并行 |
+| `prefetch_factor` | 2 | 每个 worker 预取批次数 |
+| `persistent_workers` | 自动 | `num_workers>0` 时开启，避免每 epoch 重建进程 |
+| `pin_memory` | 自动 | CUDA 可用时开启，加速 H2D 拷贝 |
+
+数据传输还配合了 `non_blocking=True` 实现异步拷贝。
+
+#### 瓶颈 3：batch 过小 + 未开启计算加速
+
+DiT base 有 308M 参数，`batch_size=32` 时单次前向太快，GPU 大部分时间在等 kernel launch。
+
+| 配置项 | 默认 | 作用 |
+|--------|------|------|
+| `use_tf32` | **true** | Ampere+ (A100/H100/RTX30+) 矩阵乘用 TF32，显著加速且精度损失极小 |
+| `cudnn_benchmark` | **true** | 输入尺寸固定时自动搜索最优 kernel |
+| `use_amp` | false | 混合精度，建议开启，速度提升明显 |
+| `use_compile` | false | `torch.compile`，稳态后快 20-30%，但首个 epoch 编译较慢 |
+| `grad_accum_steps` | 1 | 梯度累积，显存不足时等效放大 batch |
+
+DDP + 梯度累积组合时，累积中间步会自动 `no_sync()` 跳过梯度同步，减少通信开销。
+
+### 推荐配置组合
+
+**4 卡追求吞吐**
+```bash
+torchrun --nproc_per_node=4 scripts/pretrain.py --stage fm \
+    --embedding_dir ./output/embeddings \
+    --batch_size 128 --num_workers 8 --use_amp \
+    --val_every 5 --val_ode_steps 10
+```
+
+**显存受限（大模型）**
+```bash
+torchrun --nproc_per_node=4 scripts/pretrain.py --stage fm \
+    --embedding_dir ./output/embeddings \
+    --dit_preset large --batch_size 16 --grad_accum 8 \
+    --use_amp --grad_ckpt
+```
+
+**快速调试**
+```bash
+python scripts/pretrain.py --stage fm \
+    --embedding_dir ./output/embeddings \
+    --dit_preset tiny --epochs 2 --no_val_cos_sim
+```
+
+### 性能监控
+
+TensorBoard 中新增了性能指标，可直接观察优化效果：
+
+| 指标 | 说明 |
+|------|------|
+| `perf/epoch_seconds` | 每 epoch 耗时 |
+| `perf/samples_per_sec` | 吞吐量（样本/秒） |
+| `meta/global_batch_size` | 实际全局 batch |
+| `meta/world_size` | 卡数 |
+| `meta/num_train_pairs` | 训练样本对数（可看出 pair_mode 的扩增效果） |
+| `step/delta_t_mean` | 平均时间跨度 |
+
+---
+
 ## 使用方法
 
 ### 1. 安装依赖
@@ -382,6 +553,29 @@ python scripts/train_opd.py --fm_checkpoint ... --data_dir ...
 | `fm.use_amp` | false | 混合精度训练 |
 | `fm.time_weight_mode` | mid | 时间加权: none / mid / late / early |
 | `fm.ema_loss_alpha` | 0.1 | Loss EMA 平滑系数 |
+
+### 训练样本构造
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `fm.pair_mode` | last_target | last_target / all_pairs / adjacent |
+| `fm.use_delta_t_condition` | true | delta_t 条件注入 (修训推不一致) |
+| `fm.delta_t_from_timestamp` | true | 优先用真实时间戳算 delta_t |
+
+### 性能与多卡
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `fm.num_workers` | 4 | DataLoader 并行进程数 |
+| `fm.lazy_load` | true | 懒加载 .pt (配合 num_workers) |
+| `fm.val_every` | 1 | 每 N epoch 验证一次 |
+| `fm.val_ode_steps` | 10 | 验证 ODE 步数 (越小越快) |
+| `fm.val_compute_cos_sim` | true | false 则跳过 ODE，验证极快 |
+| `fm.use_tf32` | true | Ampere+ 矩阵乘加速 |
+| `fm.cudnn_benchmark` | true | 自动选最优 kernel |
+| `fm.use_compile` | false | torch.compile |
+| `fm.grad_accum_steps` | 1 | 梯度累积 |
+| `fm.distributed` | false | 由 torchrun 自动检测 |
 
 ### OPD 蒸馏
 

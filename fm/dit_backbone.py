@@ -402,6 +402,15 @@ class DiTVelocityNetwork(nn.Module):
             nn.Linear(dim, dim),
         )
 
+        # delta_t 编码 → dim (真实时间跨度条件, 修复训推不一致)
+        # 训练时告知模型 "要预测多远的未来", 与推理语义对齐
+        self.delta_t_embed = nn.Sequential(
+            SinusoidalTimeEmbedding(time_dim),
+            nn.Linear(time_dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim),
+        )
+
         # DiT Blocks
         self.blocks = nn.ModuleList([
             DiTBlock(
@@ -452,12 +461,14 @@ class DiTVelocityNetwork(nn.Module):
         x_t: torch.Tensor,
         t: torch.Tensor,
         condition: Optional[torch.Tensor] = None,
+        delta_t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
             x_t: (batch, data_dim) 加噪状态
-            t: (batch,) 时间步 [0, 1]
+            t: (batch,) FM 加噪时间步 [0, 1]
             condition: (batch, cond_dim) 条件 embedding
+            delta_t: (batch,) 真实时间跨度 [0, 1]，None 则不注入
 
         Returns:
             v_pred: (batch, data_dim) 预测速度场
@@ -467,10 +478,12 @@ class DiTVelocityNetwork(nn.Module):
         # 1. Patchify
         tokens = self.patchify(x_t)                      # (B, P, dim)
 
-        # 2. 条件向量: time + condition
+        # 2. 条件向量: FM 时间步 + 用户当前状态 + 预测时间跨度
         c = self.time_embed(t)                            # (B, dim)
         if condition is not None:
             c = c + self.cond_embed(condition)
+        if delta_t is not None:
+            c = c + self.delta_t_embed(delta_t)
 
         # 3. DiT Blocks
         for block in self.blocks:

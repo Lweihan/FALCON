@@ -77,6 +77,30 @@ class FMConfig:
     time_weight_scale: float = 1.0  # 加权幅度缩放
     # EMA loss
     ema_loss_alpha: float = 0.1    # loss EMA 平滑系数
+    # ── 配对策略 ──
+    # last_target: 随机早期步 → 最后一步 (默认, 数据利用率 1/(T-1))
+    # all_pairs:   枚举所有 (i,j) i<j     (利用率 100%)
+    # adjacent:    相邻配对 (i, i+1)
+    pair_mode: str = "last_target"
+    use_delta_t_condition: bool = True   # 将真实时间跨度注入网络 (修训推不一致)
+    delta_t_from_timestamp: bool = True  # 优先用时间戳算 delta_t, 失败回退步数比例
+    # ── 数据加载 ──
+    num_workers: int = 4
+    lazy_load: bool = True          # 懒加载 .pt, 配合 num_workers 并行 IO
+    prefetch_factor: int = 2
+    drop_last: bool = False
+    # ── 验证优化 (GPU 利用率关键) ──
+    val_every: int = 1              # 每 N epoch 验证一次
+    val_ode_steps: int = 10         # 验证 ODE 步数 (越小越快)
+    val_max_batches: int = -1       # -1 全量; 正数则只跑前 N 个 batch
+    val_compute_cos_sim: bool = True  # false 则完全跳过 ODE, 验证极快
+    # ── 计算性能 ──
+    use_tf32: bool = True           # Ampere+ 矩阵乘加速
+    cudnn_benchmark: bool = True    # 固定尺寸下自动选最优 kernel
+    use_compile: bool = False       # torch.compile (首次编译慢, 之后快 20-30%)
+    grad_accum_steps: int = 1       # 梯度累积, 等效放大 batch
+    # ── 多卡 ──
+    distributed: bool = False       # 由 torchrun 环境变量自动检测覆盖
 
     def resolve_dit_params(self) -> dict:
         """

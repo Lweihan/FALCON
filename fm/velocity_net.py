@@ -93,11 +93,16 @@ class VelocityNetwork(nn.Module):
         x_t: torch.Tensor,
         t: torch.Tensor,
         condition: torch.Tensor = None,
+        delta_t: torch.Tensor = None,
     ) -> torch.Tensor:
+        """delta_t 参数仅为与 DiT 接口对齐, MLP 版本将其拼接入时间编码"""
         batch_size = x_t.size(0)
         device = x_t.device
 
         time_emb = self.time_embed(t)
+        if delta_t is not None:
+            time_emb = time_emb + self.time_embed(delta_t)
+
         cond_emb = self.cond_proj(condition) if condition is not None else \
             torch.zeros(batch_size, self.cond_proj[0].out_features, device=device)
 
@@ -183,12 +188,14 @@ class TransformerVelocityNetwork(nn.Module):
         x_t: torch.Tensor,
         t: torch.Tensor,
         condition: torch.Tensor = None,
+        delta_t: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Args:
             x_t: (batch, data_dim) 加噪状态
             t: (batch,) 时间步
             condition: (batch, cond_dim) 条件 embedding
+            delta_t: (batch,) 真实时间跨度 (与 DiT 接口对齐, 叠加到 time token)
 
         Returns:
             v_pred: (batch, data_dim) 预测速度场
@@ -199,6 +206,8 @@ class TransformerVelocityNetwork(nn.Module):
         # 投影到 transformer_dim
         x_tok = self.x_proj(x_t)                   # (batch, D)
         t_tok = self.time_embed(t)                  # (batch, D)
+        if delta_t is not None:
+            t_tok = t_tok + self.time_embed(delta_t)
         c_tok = self.cond_proj(condition) if condition is not None else \
             torch.zeros(batch_size, self.transformer_dim, device=device)
 

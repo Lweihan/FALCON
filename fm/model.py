@@ -166,15 +166,41 @@ class FlowMatchingModel(torch.nn.Module):
 
         return w
 
+    def forward(
+        self,
+        x_clean: torch.Tensor,
+        condition: torch.Tensor = None,
+        time_weight_mode: str = "mid",
+        time_weight_scale: float = 1.0,
+        delta_t: torch.Tensor = None,
+    ) -> dict:
+        """
+        forward 即训练损失计算。
+
+        这样设计的原因: DDP 只会为通过 forward() 的调用注册梯度同步 hook。
+        若直接调用 module.compute_loss()，多卡训练时梯度不会 all_reduce。
+        """
+        return self.compute_loss(
+            x_clean, condition, time_weight_mode, time_weight_scale, delta_t
+        )
+
     def compute_loss(
         self,
         x_clean: torch.Tensor,
         condition: torch.Tensor = None,
         time_weight_mode: str = "mid",
         time_weight_scale: float = 1.0,
+        delta_t: torch.Tensor = None,
     ) -> dict:
         """
         Flow Matching 训练损失: w(t) * ||v_pred - v_t||^2
+
+        Args:
+            x_clean: (batch, dim) 目标 embedding
+            condition: (batch, dim) 条件 embedding
+            time_weight_mode: 时间加权策略
+            time_weight_scale: 加权幅度
+            delta_t: (batch,) 真实时间跨度, 注入网络以修复训推不一致
 
         Returns:
             dict with: loss, mse_raw, mse_weighted, time_weight_mean, t_mean
@@ -185,7 +211,7 @@ class FlowMatchingModel(torch.nn.Module):
         t = torch.rand(batch_size, device=device)
         noise = torch.randn_like(x_clean)
         x_t, v_t = flow_match_forward(x_clean, t, noise)
-        v_pred = self.velocity_net(x_t, t, condition)
+        v_pred = self.velocity_net(x_t, t, condition, delta_t)
 
         # 逐样本 MSE
         per_sample_mse = F.mse_loss(v_pred, v_t, reduction='none').mean(dim=-1)  # (batch,)
@@ -244,20 +270,31 @@ class FlowMatchingModel(torch.nn.Module):
         delta_t: float,
         num_steps: int = 100,
         method: str = 'euler',
+        inject_delta_t: bool = True,
     ) -> torch.Tensor:
-        """预测用户在 delta_t 时间后的 embedding"""
+        """
+        预测用户在 delta_t 时间后的 embedding。
+
+        delta_t 同时扮演两个角色:
+          1. ODE 起点与步长控制 (决定从多少噪声开始去噪)
+          2. 网络条件输入 (告知模型要预测多远的未来)
+        """
         batch_size = condition.size(0)
         device = condition.device
         condition = condition.to(device)
 
+        delta_t_tensor = (
+            torch.full((batch_size,), delta_t, device=device) if inject_delta_t else None
+        )
+
         noise = torch.randn_like(condition)
         x_t = (1.0 - delta_t) * condition + delta_t * noise
 
-        dt = delta_t / num_steps
+        dt = delta_t / max(num_steps, 1)
         for step in range(num_steps):
             t_val = delta_t - step * dt
             t = torch.full((batch_size,), t_val, device=device)
-            v = self.velocity_net(x_t, t, condition)
+            v = self.velocity_net(x_t, t, condition, delta_t_tensor)
             x_t = x_t - v * dt
         return x_t
 
@@ -266,6 +303,7 @@ class FlowMatchingModel(torch.nn.Module):
         embedding: torch.Tensor,
         delta_t: float = 0.5,
         num_steps: int = 10,
+        inject_delta_t: bool = True,
     ) -> torch.Tensor:
         """
         对给定 embedding 做 FM 流形优化 (保留梯度，供下游 Ranker 联合训练)。
@@ -273,17 +311,13 @@ class FlowMatchingModel(torch.nn.Module):
         与 predict_future_embedding 的区别:
         - 本方法不使用 @torch.no_grad()，梯度可回传到 velocity_net 与上游 Ranker
         - 步数通常较少 (num_steps=10)，用于训练时的可微 ODE 求解
-
-        Args:
-            embedding: (batch, data_dim) 待优化 embedding
-            delta_t: 优化强度 [0, 1]
-            num_steps: ODE 步数
-
-        Returns:
-            optimized: (batch, data_dim) 优化后 embedding
         """
         batch_size = embedding.size(0)
         device = embedding.device
+
+        delta_t_tensor = (
+            torch.full((batch_size,), delta_t, device=device) if inject_delta_t else None
+        )
 
         noise = torch.randn_like(embedding)
         x_t = (1.0 - delta_t) * embedding + delta_t * noise
@@ -292,6 +326,6 @@ class FlowMatchingModel(torch.nn.Module):
         for step in range(num_steps):
             t_val = delta_t - step * dt
             t = torch.full((batch_size,), t_val, device=device)
-            v = self.velocity_net(x_t, t, embedding)
+            v = self.velocity_net(x_t, t, embedding, delta_t_tensor)
             x_t = x_t - v * dt
         return x_t

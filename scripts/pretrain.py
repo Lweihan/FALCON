@@ -95,13 +95,15 @@ def run_latent_stage(config: FALCONConfig, args) -> str:
 # Stage 2: FM Teacher 预训练
 # ════════════════════════════════════════════════════════════
 
-def run_fm_stage(config: FALCONConfig, args, embedding_dir: str) -> str:
+def run_fm_stage(config: FALCONConfig, args, embedding_dir: str, device: str = None,
+                 distributed: bool = False) -> str:
     """
     训练 Flow Matching Teacher。
 
     Returns:
         fm_output_dir: checkpoint 目录
     """
+    from common.distributed import is_main_process
     from fm.trainer import FMTrainer
 
     fm_output_dir = (
@@ -116,14 +118,15 @@ def run_fm_stage(config: FALCONConfig, args, embedding_dir: str) -> str:
             f"请先运行 --stage latent 或指定 --embedding_dir"
         )
 
-    logger.info("=" * 70)
-    logger.info("Stage 2: FM Teacher 预训练")
-    logger.info("=" * 70)
-    logger.info(f"  Embedding 目录:  {embedding_dir}")
-    logger.info(f"  输出目录:        {fm_output_dir}")
+    if is_main_process():
+        logger.info("=" * 70)
+        logger.info("Stage 2: FM Teacher 预训练")
+        logger.info("=" * 70)
+        logger.info(f"  Embedding 目录:  {embedding_dir}")
+        logger.info(f"  输出目录:        {fm_output_dir}")
 
-    device = config.resolve_device()
-    trainer = FMTrainer(config.fm, device=device)
+    device = device or config.resolve_device()
+    trainer = FMTrainer(config.fm, device=device, distributed=distributed)
     trainer.train(
         data_dir=embedding_dir,
         output_dir=fm_output_dir,
@@ -137,23 +140,62 @@ def run_fm_stage(config: FALCONConfig, args, embedding_dir: str) -> str:
 # 主流程
 # ════════════════════════════════════════════════════════════
 
-def apply_cli_overrides(config: FALCONConfig, args):
+def apply_cli_overrides(config: FALCONConfig, args, world_size: int = 1):
     """命令行参数覆盖配置"""
+    # 模型规模
     if args.dit_preset:
         config.fm.dit_preset = args.dit_preset
         config.fm.backbone_type = "dit"
     if args.backbone:
         config.fm.backbone_type = args.backbone
+    # 训练超参
     if args.epochs is not None:
         config.fm.epochs = args.epochs
-    if args.batch_size is not None:
-        config.fm.batch_size = args.batch_size
     if args.lr is not None:
         config.fm.lr = args.lr
+    if args.grad_accum is not None:
+        config.fm.grad_accum_steps = args.grad_accum
+
+    # batch_size: --global_batch_size 优先, 自动换算 per-GPU
+    if args.global_batch_size is not None:
+        accum = config.fm.grad_accum_steps
+        per_gpu = max(args.global_batch_size // (world_size * accum), 1)
+        config.fm.batch_size = per_gpu
+    elif args.batch_size is not None:
+        config.fm.batch_size = args.batch_size
+
+    # 配对策略 / delta_t
+    if args.pair_mode:
+        config.fm.pair_mode = args.pair_mode
+    if args.no_delta_t_condition:
+        config.fm.use_delta_t_condition = False
+
+    # 数据加载
+    if args.num_workers is not None:
+        config.fm.num_workers = args.num_workers
+    if args.no_lazy_load:
+        config.fm.lazy_load = False
+
+    # 验证优化
+    if args.val_every is not None:
+        config.fm.val_every = args.val_every
+    if args.val_ode_steps is not None:
+        config.fm.val_ode_steps = args.val_ode_steps
+    if args.val_max_batches is not None:
+        config.fm.val_max_batches = args.val_max_batches
+    if args.no_val_cos_sim:
+        config.fm.val_compute_cos_sim = False
+
+    # 性能
     if args.use_amp:
         config.fm.use_amp = True
     if args.grad_ckpt:
         config.fm.use_gradient_checkpointing = True
+    if args.use_compile:
+        config.fm.use_compile = True
+    if args.no_tf32:
+        config.fm.use_tf32 = False
+
     if args.output_dir:
         config.output_dir = args.output_dir
 
@@ -162,6 +204,17 @@ def main():
     parser = argparse.ArgumentParser(
         description="FALCON 预训练 (Latent Clue 提取 + FM Teacher)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+多卡训练示例:
+  torchrun --nproc_per_node=4 scripts/pretrain.py --stage fm \\
+      --embedding_dir ./output/embeddings --batch_size 64
+
+GPU 利用率优化示例:
+  torchrun --nproc_per_node=4 scripts/pretrain.py --stage fm \\
+      --embedding_dir ./output/embeddings \\
+      --batch_size 128 --num_workers 8 --use_amp \\
+      --val_every 5 --val_ode_steps 10
+        """,
     )
     parser.add_argument("--config", type=str, default="configs/falcon_config.yaml")
     parser.add_argument(
@@ -184,46 +237,94 @@ def main():
         "--backbone", type=str, default=None, choices=["dit", "transformer", "mlp"],
         help="Backbone 类型",
     )
+    # 配对策略
+    parser.add_argument(
+        "--pair_mode", type=str, default=None,
+        choices=["last_target", "all_pairs", "adjacent"],
+        help="配对策略: last_target(默认) / all_pairs(全配对) / adjacent(相邻)",
+    )
+    parser.add_argument("--no_delta_t_condition", action="store_true",
+                        help="关闭 delta_t 条件注入 (退化为旧行为)")
     # 训练超参
     parser.add_argument("--epochs", type=int, default=None)
-    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=None,
+                        help="per-GPU batch size")
+    parser.add_argument("--global_batch_size", type=int, default=None,
+                        help="全局 batch size, 自动换算 per-GPU (优先于 --batch_size)")
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--grad_accum", type=int, default=None, help="梯度累积步数")
+    # 数据加载
+    parser.add_argument("--num_workers", type=int, default=None,
+                        help="DataLoader 并行进程数 (建议 4-8)")
+    parser.add_argument("--no_lazy_load", action="store_true",
+                        help="关闭懒加载 (数据全部预载入内存)")
+    # 验证优化
+    parser.add_argument("--val_every", type=int, default=None, help="每 N epoch 验证一次")
+    parser.add_argument("--val_ode_steps", type=int, default=None,
+                        help="验证 ODE 步数 (越小越快, 默认 10)")
+    parser.add_argument("--val_max_batches", type=int, default=None,
+                        help="验证最多跑 N 个 batch (-1 全量)")
+    parser.add_argument("--no_val_cos_sim", action="store_true",
+                        help="跳过验证时的 ODE 求解 (验证极快)")
+    # 性能
     parser.add_argument("--use_amp", action="store_true", help="启用混合精度")
     parser.add_argument("--grad_ckpt", action="store_true", help="启用梯度检查点")
+    parser.add_argument("--use_compile", action="store_true", help="启用 torch.compile")
+    parser.add_argument("--no_tf32", action="store_true", help="关闭 TF32")
     args = parser.parse_args()
 
-    config = FALCONConfig.from_yaml(args.config)
-    apply_cli_overrides(config, args)
-    set_seed(config.seed)
-
-    logger.info("=" * 70)
-    logger.info("FALCON 预训练")
-    logger.info("  Flow matching in the Advertising scenarios")
-    logger.info("  based on Latent Clue Online policy distillatioN")
-    logger.info("=" * 70)
-    logger.info(f"  设备:     {config.resolve_device()}")
-    logger.info(f"  随机种子: {config.seed}")
-    logger.info(f"  执行阶段: {args.stage}")
-
-    stages = ["latent", "fm"] if args.stage == "all" else [args.stage]
-
-    embedding_dir = (
-        args.embedding_dir
-        or config.pretrain.embedding_dir
-        or os.path.join(config.output_dir, "embeddings")
+    # ── 分布式初始化 ──
+    from common.distributed import (
+        cleanup_distributed, is_main_process, setup_distributed,
     )
+    is_dist, rank, world_size, local_rank, device = setup_distributed()
 
-    if "latent" in stages:
-        embedding_dir = run_latent_stage(config, args)
+    config = FALCONConfig.from_yaml(args.config)
+    apply_cli_overrides(config, args, world_size=world_size)
+    config.fm.distributed = is_dist
+    set_seed(config.seed + rank)   # 各卡不同种子, 避免噪声采样完全相同
 
-    if "fm" in stages:
-        fm_dir = run_fm_stage(config, args, embedding_dir)
-        logger.info("")
-        logger.info("预训练完成，后续步骤:")
-        logger.info(f"  python scripts/posttrain.py \\")
-        logger.info(f"      --config {args.config} \\")
-        logger.info(f"      --fm_checkpoint {os.path.join(fm_dir, 'best_fm.pt')} \\")
-        logger.info(f"      --embedding_dir {embedding_dir}")
+    if is_main_process():
+        logger.info("=" * 70)
+        logger.info("FALCON 预训练")
+        logger.info("  Flow matching in the Advertising scenarios")
+        logger.info("  based on Latent Clue Online policy distillatioN")
+        logger.info("=" * 70)
+        logger.info(f"  设备:     {device}")
+        logger.info(f"  随机种子: {config.seed}")
+        logger.info(f"  执行阶段: {args.stage}")
+        if is_dist:
+            logger.info(f"  分布式:   DDP, world_size={world_size}")
+
+    try:
+        stages = ["latent", "fm"] if args.stage == "all" else [args.stage]
+
+        embedding_dir = (
+            args.embedding_dir
+            or config.pretrain.embedding_dir
+            or os.path.join(config.output_dir, "embeddings")
+        )
+
+        # Latent 阶段不做多卡 (embedding 模型推理，仅主进程执行)
+        if "latent" in stages:
+            if is_main_process():
+                embedding_dir = run_latent_stage(config, args)
+            if is_dist:
+                from common.distributed import barrier
+                barrier()
+
+        if "fm" in stages:
+            fm_dir = run_fm_stage(config, args, embedding_dir,
+                                  device=device, distributed=is_dist)
+            if is_main_process():
+                logger.info("")
+                logger.info("预训练完成，后续步骤:")
+                logger.info(f"  python scripts/posttrain.py \\")
+                logger.info(f"      --config {args.config} \\")
+                logger.info(f"      --fm_checkpoint {os.path.join(fm_dir, 'best_fm.pt')} \\")
+                logger.info(f"      --embedding_dir {embedding_dir}")
+    finally:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":
