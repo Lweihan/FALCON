@@ -40,23 +40,8 @@ class FMTeacher:
         self.use_ema = use_ema
         self.ema_decay = ema_decay
 
-        # 主模型
-        self.model = FlowMatchingModel(
-            data_dim=fm_config.data_dim,
-            time_dim=fm_config.time_dim,
-            cond_dim=fm_config.cond_dim,
-            # MLP 参数
-            hidden_dim=fm_config.hidden_dim,
-            num_layers=fm_config.num_layers,
-            dropout=0.0,  # 推理不用 dropout
-            # Transformer 参数
-            backbone_type=fm_config.backbone_type,
-            transformer_dim=fm_config.transformer_dim,
-            transformer_depth=fm_config.transformer_depth,
-            transformer_heads=fm_config.transformer_heads,
-            transformer_mlp_ratio=fm_config.transformer_mlp_ratio,
-            transformer_dropout=0.0,  # 推理不用 dropout
-        ).to(device)
+        # 主模型 (推理不用 dropout)
+        self.model = FlowMatchingModel.from_config(fm_config, dropout_override=0.0).to(device)
 
         # 加载 checkpoint
         if checkpoint_path:

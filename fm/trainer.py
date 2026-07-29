@@ -31,31 +31,25 @@ class FMTrainer:
         self.config = config
         self.device = device
 
-        self.model = FlowMatchingModel(
-            data_dim=config.data_dim,
-            time_dim=config.time_dim,
-            cond_dim=config.cond_dim,
-            # MLP 参数
-            hidden_dim=config.hidden_dim,
-            num_layers=config.num_layers,
-            dropout=config.dropout,
-            # Transformer 参数
-            backbone_type=config.backbone_type,
-            transformer_dim=config.transformer_dim,
-            transformer_depth=config.transformer_depth,
-            transformer_heads=config.transformer_heads,
-            transformer_mlp_ratio=config.transformer_mlp_ratio,
-            transformer_dropout=config.transformer_dropout,
-        ).to(device)
+        self.model = FlowMatchingModel.from_config(config).to(device)
 
         total_params = count_parameters(self.model)
         vel_params = count_parameters(self.model.velocity_net)
+        dit = config.resolve_dit_params()
+
         logger.info(f"FM Teacher 初始化:")
         logger.info(f"  Backbone: {config.backbone_type}")
-        logger.info(f"  总参数量: {total_params:,}")
-        logger.info(f"  速度网络参数量: {vel_params:,}")
+        if config.backbone_type == 'dit':
+            logger.info(f"  DiT preset: {config.dit_preset}")
+            logger.info(f"    dim={dit['dit_dim']}, depth={dit['dit_depth']}, "
+                        f"heads={dit['dit_heads']}, patches={dit['dit_num_patches']}")
+            logger.info(f"    qk_norm={config.dit_qk_norm}, rope={config.dit_use_rope}, "
+                        f"grad_ckpt={config.use_gradient_checkpointing}")
+        logger.info(f"  总参数量: {total_params:,} ({total_params / 1e6:.1f}M)")
+        logger.info(f"  速度网络参数量: {vel_params:,} ({vel_params / 1e6:.1f}M)")
         logger.info(f"  时间加权: mode={config.time_weight_mode}, scale={config.time_weight_scale}")
         logger.info(f"  EMA loss alpha: {config.ema_loss_alpha}")
+        logger.info(f"  AMP: {config.use_amp}")
 
     def train(
         self,
@@ -72,7 +66,13 @@ class FMTrainer:
         logger.info(f"TensorBoard 日志目录: {tb_dir}")
 
         # 记录元信息
+        dit = self.config.resolve_dit_params()
         writer.add_text('meta/backbone_type', self.config.backbone_type, 0)
+        if self.config.backbone_type == 'dit':
+            writer.add_text('meta/dit_preset', self.config.dit_preset, 0)
+            writer.add_scalar('meta/dit_dim', dit['dit_dim'], 0)
+            writer.add_scalar('meta/dit_depth', dit['dit_depth'], 0)
+            writer.add_scalar('meta/dit_num_patches', dit['dit_num_patches'], 0)
         writer.add_scalar('meta/param_count_total', count_parameters(self.model), 0)
         writer.add_scalar('meta/param_count_velocity_net', count_parameters(self.model.velocity_net), 0)
 
@@ -86,6 +86,12 @@ class FMTrainer:
         optimizer = AdamW(self.model.parameters(), lr=self.config.lr, weight_decay=self.config.weight_decay)
         scheduler = CosineAnnealingLR(optimizer, T_max=self.config.epochs, eta_min=self.config.lr * 0.01)
 
+        # AMP 混合精度
+        use_amp = self.config.use_amp and 'cuda' in str(self.device)
+        scaler = torch.cuda.amp.GradScaler() if use_amp else None
+        if use_amp:
+            logger.info("已启用 AMP 混合精度训练")
+
         best_val = float('inf')
         log = []
         global_step = 0
@@ -97,7 +103,7 @@ class FMTrainer:
 
         for epoch in range(1, self.config.epochs + 1):
             t0 = time.time()
-            train_stats, train_steps = self._train_epoch(train_loader, optimizer, writer, global_step)
+            train_stats, train_steps = self._train_epoch(train_loader, optimizer, writer, global_step, scaler)
             val_stats = self._validate(val_loader) if len(val_loader.dataset) > 0 else {}
             scheduler.step()
             global_step += train_steps
@@ -172,7 +178,7 @@ class FMTrainer:
         logger.info(f"FM 训练完成, 最佳 ema_val={best_val:.6f}")
         logger.info(f"查看 TensorBoard: tensorboard --logdir {tb_dir}")
 
-    def _train_epoch(self, loader, optimizer, writer, step_offset) -> tuple:
+    def _train_epoch(self, loader, optimizer, writer, step_offset, scaler=None) -> tuple:
         self.model.train()
         total_loss = 0.0
         total_mse_raw = 0.0
@@ -180,20 +186,37 @@ class FMTrainer:
         total_time_weight = 0.0
         total_t_mean = 0.0
         n = 0
+        use_amp = scaler is not None
+
         for batch in loader:
             x_clean = batch['x_clean'].to(self.device)
             cond = batch['condition'].to(self.device)
-            loss_dict = self.model.compute_loss(
-                x_clean, cond,
-                time_weight_mode=self.config.time_weight_mode,
-                time_weight_scale=self.config.time_weight_scale,
-            )
 
-            optimizer.zero_grad()
-            loss_dict['loss'].backward()
-            if self.config.grad_clip > 0:
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+            if use_amp:
+                with torch.cuda.amp.autocast():
+                    loss_dict = self.model.compute_loss(
+                        x_clean, cond,
+                        time_weight_mode=self.config.time_weight_mode,
+                        time_weight_scale=self.config.time_weight_scale,
+                    )
+                scaler.scale(loss_dict['loss']).backward()
+                if self.config.grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss_dict = self.model.compute_loss(
+                    x_clean, cond,
+                    time_weight_mode=self.config.time_weight_mode,
+                    time_weight_scale=self.config.time_weight_scale,
+                )
+                loss_dict['loss'].backward()
+                if self.config.grad_clip > 0:
+                    nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+                optimizer.step()
 
             total_loss += loss_dict['loss'].item()
             total_mse_raw += loss_dict['mse_raw']

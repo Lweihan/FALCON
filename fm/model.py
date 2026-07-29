@@ -1,7 +1,7 @@
 """
 model.py — Flow Matching 完整模型
 ===================================
-支持 MLP / Transformer 两种 backbone，通过配置切换。
+支持 DiT / Transformer / MLP 三种 backbone，通过配置切换。
 """
 
 import torch
@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from .flow_core import flow_match_forward
 from .velocity_net import VelocityNetwork, TransformerVelocityNetwork
+from .dit_backbone import DiTVelocityNetwork
 
 
 class FlowMatchingModel(torch.nn.Module):
@@ -16,8 +17,11 @@ class FlowMatchingModel(torch.nn.Module):
     Flow Matching 用户特征预测模型 (Teacher)。
 
     支持 backbone:
-    - transformer (默认): TransformerVelocityNetwork (~20-50M 参数)
-    - mlp:          VelocityNetwork (~3-5M 参数)
+    - dit (推荐默认): DiTVelocityNetwork
+        Patchify + AdaLN-Zero + QK-Norm + RoPE + SwiGLU
+        preset: tiny(~10M) / small(~80M) / base(~250M) / large(~1.2B) / xl(~4B)
+    - transformer:   TransformerVelocityNetwork (~33M, 旧版保留兼容)
+    - mlp:           VelocityNetwork (~3.6M, 轻量)
 
     训练: compute_loss(x_clean, condition, time_weight_mode, time_weight_scale)
     推理: sample(condition) / predict_future_embedding(condition, delta_t)
@@ -28,12 +32,22 @@ class FlowMatchingModel(torch.nn.Module):
         data_dim: int = 256,
         time_dim: int = 128,
         cond_dim: int = 256,
-        # MLP 参数
+        backbone_type: str = "dit",
+        # ── DiT 参数 ──
+        dit_dim: int = 1024,
+        dit_depth: int = 16,
+        dit_heads: int = 16,
+        dit_num_patches: int = 16,
+        dit_mlp_ratio: float = 4.0,
+        dit_dropout: float = 0.0,
+        dit_qk_norm: bool = True,
+        dit_use_rope: bool = True,
+        use_gradient_checkpointing: bool = False,
+        # ── MLP 参数 ──
         hidden_dim: int = 512,
         num_layers: int = 6,
         dropout: float = 0.1,
-        # Transformer 参数
-        backbone_type: str = "transformer",
+        # ── Transformer 参数 (旧版) ──
         transformer_dim: int = 1024,
         transformer_depth: int = 8,
         transformer_heads: int = 8,
@@ -44,7 +58,22 @@ class FlowMatchingModel(torch.nn.Module):
         self.data_dim = data_dim
         self.backbone_type = backbone_type
 
-        if backbone_type == "transformer":
+        if backbone_type == "dit":
+            self.velocity_net = DiTVelocityNetwork(
+                data_dim=data_dim,
+                cond_dim=cond_dim,
+                dim=dit_dim,
+                depth=dit_depth,
+                num_heads=dit_heads,
+                num_patches=dit_num_patches,
+                mlp_ratio=dit_mlp_ratio,
+                dropout=dit_dropout,
+                qk_norm=dit_qk_norm,
+                use_rope=dit_use_rope,
+                time_dim=max(time_dim, 256),
+                use_gradient_checkpointing=use_gradient_checkpointing,
+            )
+        elif backbone_type == "transformer":
             self.velocity_net = TransformerVelocityNetwork(
                 data_dim=data_dim,
                 time_dim=time_dim,
@@ -65,7 +94,48 @@ class FlowMatchingModel(torch.nn.Module):
                 dropout=dropout,
             )
         else:
-            raise ValueError(f"Unknown backbone_type: {backbone_type}, choose from transformer/mlp")
+            raise ValueError(
+                f"Unknown backbone_type: {backbone_type}, choose from dit/transformer/mlp"
+            )
+
+    @classmethod
+    def from_config(cls, fm_config, dropout_override: float = None) -> "FlowMatchingModel":
+        """
+        从 FMConfig 构建模型，自动解析 dit_preset。
+
+        Args:
+            fm_config: FMConfig 实例
+            dropout_override: 若指定则覆盖所有 dropout (推理时设 0.0)
+        """
+        dit = fm_config.resolve_dit_params()
+        drop = dropout_override
+
+        return cls(
+            data_dim=fm_config.data_dim,
+            time_dim=fm_config.time_dim,
+            cond_dim=fm_config.cond_dim,
+            backbone_type=fm_config.backbone_type,
+            # DiT
+            dit_dim=dit["dit_dim"],
+            dit_depth=dit["dit_depth"],
+            dit_heads=dit["dit_heads"],
+            dit_num_patches=dit["dit_num_patches"],
+            dit_mlp_ratio=fm_config.dit_mlp_ratio,
+            dit_dropout=drop if drop is not None else fm_config.dit_dropout,
+            dit_qk_norm=fm_config.dit_qk_norm,
+            dit_use_rope=fm_config.dit_use_rope,
+            use_gradient_checkpointing=fm_config.use_gradient_checkpointing,
+            # MLP
+            hidden_dim=fm_config.hidden_dim,
+            num_layers=fm_config.num_layers,
+            dropout=drop if drop is not None else fm_config.dropout,
+            # Transformer
+            transformer_dim=fm_config.transformer_dim,
+            transformer_depth=fm_config.transformer_depth,
+            transformer_heads=fm_config.transformer_heads,
+            transformer_mlp_ratio=fm_config.transformer_mlp_ratio,
+            transformer_dropout=drop if drop is not None else fm_config.transformer_dropout,
+        )
 
     @staticmethod
     def compute_time_weights(
@@ -188,5 +258,40 @@ class FlowMatchingModel(torch.nn.Module):
             t_val = delta_t - step * dt
             t = torch.full((batch_size,), t_val, device=device)
             v = self.velocity_net(x_t, t, condition)
+            x_t = x_t - v * dt
+        return x_t
+
+    def optimize_embedding(
+        self,
+        embedding: torch.Tensor,
+        delta_t: float = 0.5,
+        num_steps: int = 10,
+    ) -> torch.Tensor:
+        """
+        对给定 embedding 做 FM 流形优化 (保留梯度，供下游 Ranker 联合训练)。
+
+        与 predict_future_embedding 的区别:
+        - 本方法不使用 @torch.no_grad()，梯度可回传到 velocity_net 与上游 Ranker
+        - 步数通常较少 (num_steps=10)，用于训练时的可微 ODE 求解
+
+        Args:
+            embedding: (batch, data_dim) 待优化 embedding
+            delta_t: 优化强度 [0, 1]
+            num_steps: ODE 步数
+
+        Returns:
+            optimized: (batch, data_dim) 优化后 embedding
+        """
+        batch_size = embedding.size(0)
+        device = embedding.device
+
+        noise = torch.randn_like(embedding)
+        x_t = (1.0 - delta_t) * embedding + delta_t * noise
+
+        dt = delta_t / max(num_steps, 1)
+        for step in range(num_steps):
+            t_val = delta_t - step * dt
+            t = torch.full((batch_size,), t_val, device=device)
+            v = self.velocity_net(x_t, t, embedding)
             x_t = x_t - v * dt
         return x_t

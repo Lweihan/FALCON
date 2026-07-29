@@ -36,17 +36,31 @@ class FMConfig:
     data_dim: int = 256           # 数据维度 (= LatentConfig.fusion_output_dim)
     time_dim: int = 128          # 时间编码维度
     cond_dim: int = 256          # 条件维度 (= data_dim)
-    # Backbone 选择
-    backbone_type: str = "transformer"  # transformer / mlp
-    # MLP backbone 参数
-    hidden_dim: int = 512        # MLP 隐藏维度
-    num_layers: int = 6          # MLP 层数
+    # Backbone 选择: dit (推荐) / transformer / mlp
+    backbone_type: str = "dit"
+    # ── DiT backbone ──
+    # preset: tiny(~10M) / small(~80M) / base(~250M) / large(~1.2B) / xl(~4B)
+    # 设为 "" 或 "custom" 时使用下面手动指定的参数
+    dit_preset: str = "base"
+    dit_dim: int = 1024
+    dit_depth: int = 16
+    dit_heads: int = 16
+    dit_num_patches: int = 16
+    dit_mlp_ratio: float = 4.0
+    dit_dropout: float = 0.0
+    dit_qk_norm: bool = True
+    dit_use_rope: bool = True
+    use_gradient_checkpointing: bool = False
+    use_amp: bool = False          # 混合精度训练
+    # ── MLP backbone ──
+    hidden_dim: int = 512
+    num_layers: int = 6
     dropout: float = 0.1
-    # Transformer backbone 参数
-    transformer_dim: int = 1024       # Transformer 隐藏维度
-    transformer_depth: int = 8        # Transformer 层数
-    transformer_heads: int = 8        # 注意力头数
-    transformer_mlp_ratio: float = 4.0  # FFN 扩展比例
+    # ── Transformer backbone (旧版, 保留兼容) ──
+    transformer_dim: int = 1024
+    transformer_depth: int = 8
+    transformer_heads: int = 8
+    transformer_mlp_ratio: float = 4.0
     transformer_dropout: float = 0.1
     # 训练
     epochs: int = 100
@@ -63,6 +77,23 @@ class FMConfig:
     time_weight_scale: float = 1.0  # 加权幅度缩放
     # EMA loss
     ema_loss_alpha: float = 0.1    # loss EMA 平滑系数
+
+    def resolve_dit_params(self) -> dict:
+        """
+        解析 DiT 超参数。若指定了有效 preset 则用 preset，否则用手动参数。
+
+        Returns:
+            dict with dit_dim, dit_depth, dit_heads, dit_num_patches
+        """
+        if self.dit_preset and self.dit_preset not in ("", "custom"):
+            from fm.dit_backbone import resolve_dit_preset
+            return resolve_dit_preset(self.dit_preset)
+        return {
+            "dit_dim": self.dit_dim,
+            "dit_depth": self.dit_depth,
+            "dit_heads": self.dit_heads,
+            "dit_num_patches": self.dit_num_patches,
+        }
 
 
 # ────────────────────────────────────────────────────────────
@@ -178,6 +209,80 @@ class ScenarioConfig:
 
 
 # ────────────────────────────────────────────────────────────
+# 下游 Ranker 配置
+# ────────────────────────────────────────────────────────────
+
+@dataclass
+class RankerConfig:
+    """下游精排模型配置"""
+    # 模型类型: dnn / deepfm / dcn / autoint / token_mixer
+    ranker_types: list = field(default_factory=lambda: ["dnn", "deepfm", "dcn", "autoint", "token_mixer"])
+    # 特征配置
+    embed_dim: int = 16
+    hidden_dims: list = field(default_factory=lambda: [256, 128, 64])
+    dropout: float = 0.1
+    activation: str = "relu"
+    # DCN 专属
+    num_cross_layers: int = 3
+    # AutoInt 专属
+    num_attention_layers: int = 3
+    num_attention_heads: int = 4
+    attention_dim: int = 64
+    # TokenMixer 专属
+    num_blocks: int = 3
+    num_groups: int = 4
+    ff_mult: int = 4
+    channel_ff_mult: int = 4
+    # 联合训练
+    joint_alpha: float = 0.5         # 直接预测损失权重
+    fm_weights: list = field(default_factory=lambda: [0.1, 0.5, 1.0])  # FM 损失权重消融
+    freeze_fm: bool = False          # 是否冻结 FM backbone
+    fast_train: bool = True          # FM 快速训练模式 (跳过 ODE 求解)
+    train_delta_t: float = 0.5
+    train_ode_steps: int = 10
+    eval_ode_steps: int = 50
+    # 训练
+    epochs: int = 3
+    batch_size: int = 1024
+    lr: float = 1e-3
+    weight_decay: float = 1e-5
+    grad_clip: float = 5.0
+    early_stop_patience: int = 2
+    # 数据
+    data_path: str = ""
+    max_samples: int = -1
+    train_ratio: float = 0.8
+    num_workers: int = 0
+    # 评估
+    eval_metrics: list = field(default_factory=lambda: ["auc", "gauc", "logloss", "ndcg"])
+    ndcg_k: int = 10
+
+
+# ────────────────────────────────────────────────────────────
+# 预训练 / 后训练阶段配置
+# ────────────────────────────────────────────────────────────
+
+@dataclass
+class PretrainConfig:
+    """预训练阶段配置 (Latent 提取 + FM Teacher)"""
+    stages: list = field(default_factory=lambda: ["latent", "fm"])
+    jsonl_path: str = ""
+    embedding_dir: str = ""     # 空则用 output_dir/embeddings
+    fm_output_dir: str = ""     # 空则用 output_dir/fm_checkpoints
+    resume_from: str = ""       # 断点续训 checkpoint 路径
+
+
+@dataclass
+class PosttrainConfig:
+    """后训练阶段配置 (OPD 蒸馏 + Ranker)"""
+    stages: list = field(default_factory=lambda: ["opd", "ranker"])
+    fm_checkpoint: str = ""
+    embedding_dir: str = ""
+    opd_output_dir: str = ""
+    ranker_output_dir: str = ""
+
+
+# ────────────────────────────────────────────────────────────
 # 全局配置
 # ────────────────────────────────────────────────────────────
 
@@ -192,6 +297,9 @@ class FALCONConfig:
     opd: OPDConfig = field(default_factory=OPDConfig)
     cf_opd: CFOPDConfig = field(default_factory=CFOPDConfig)
     scenario: ScenarioConfig = field(default_factory=ScenarioConfig)
+    ranker: RankerConfig = field(default_factory=RankerConfig)
+    pretrain: PretrainConfig = field(default_factory=PretrainConfig)
+    posttrain: PosttrainConfig = field(default_factory=PosttrainConfig)
 
     def resolve_device(self) -> str:
         if self.device == "auto":
@@ -222,6 +330,9 @@ class FALCONConfig:
         opd = OPDConfig(**d.get("opd", {}))
         cf_opd = CFOPDConfig(**d.get("cf_opd", {}))
         scenario = ScenarioConfig(**d.get("scenario", {}))
+        ranker = RankerConfig(**d.get("ranker", {}))
+        pretrain = PretrainConfig(**d.get("pretrain", {}))
+        posttrain = PosttrainConfig(**d.get("posttrain", {}))
         return cls(
             seed=d.get("seed", 42),
             output_dir=d.get("output_dir", "./output"),
@@ -231,4 +342,7 @@ class FALCONConfig:
             opd=opd,
             cf_opd=cf_opd,
             scenario=scenario,
+            ranker=ranker,
+            pretrain=pretrain,
+            posttrain=posttrain,
         )
