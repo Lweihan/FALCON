@@ -258,27 +258,44 @@ class RankerConfig:
     ff_mult: int = 4
     channel_ff_mult: int = 4
     # 联合训练
-    joint_alpha: float = 0.5         # 直接预测损失权重
+    joint_alpha: float = 0.5         # CVR loss 权重; (1-alpha)=FM flow loss 权重
     fm_weights: list = field(default_factory=lambda: [0.1, 0.5, 1.0])  # FM 损失权重消融
     freeze_fm: bool = False          # 是否冻结 FM backbone
+    freeze_fm_backbone: bool = False # 只冻结 FM backbone, 仍训 condition proj
     fast_train: bool = True          # FM 快速训练模式 (跳过 ODE 求解)
     train_delta_t: float = 0.5
     train_ode_steps: int = 10
     eval_ode_steps: int = 50
-    # 训练
+    # 训练超参
     epochs: int = 3
     batch_size: int = 1024
     lr: float = 1e-3
     weight_decay: float = 1e-5
     grad_clip: float = 5.0
     early_stop_patience: int = 2
-    # 数据
+    grad_accum: int = 4
+    use_amp: bool = True
+    save_every: int = 1
+    # 数据 (通用)
     data_path: str = ""
     max_samples: int = -1
     train_ratio: float = 0.8
-    num_workers: int = 0
+    num_workers: int = 4
+    # MAC 数据集专属
+    # load_mode: hf_streaming (不下载,流式读) / hf_download (下载后缓存) / local_parquet / local_csv
+    mac_load_mode: str = "hf_streaming"
+    mac_data_path: str = ""          # hf_streaming 时忽略; local_* 时必填
+    mac_label: str = "last"          # CVR 标签: linear / mta / first / last
+    mac_vocab_path: str = ""         # 词表保存路径, 空则不保存
+    mac_max_samples: int = -1        # -1 全量; 正数限制 (调试)
+    mac_val_ratio: float = 0.01      # streaming 模式: 前 N% 作 val (约 75万条)
+    mac_num_workers: int = 0         # streaming 时必须 0
+    seq_pool_mode: str = "mean"      # 序列特征池化: mean / max / sum
+    mm_feat_proj_dim: int = 64       # mm_feat 投影后维度 (-1 = 不投影直接拼接)
+    # 联合后训练输出
+    joint_output_dir: str = ""       # 空则用 output_dir/joint_checkpoints
     # 评估
-    eval_metrics: list = field(default_factory=lambda: ["auc", "gauc", "logloss", "ndcg"])
+    eval_metrics: list = field(default_factory=lambda: ["auc", "gauc", "logloss"])
     ndcg_k: int = 10
 
 
@@ -298,12 +315,13 @@ class PretrainConfig:
 
 @dataclass
 class PosttrainConfig:
-    """后训练阶段配置 (OPD 蒸馏 + Ranker)"""
-    stages: list = field(default_factory=lambda: ["opd", "ranker"])
-    fm_checkpoint: str = ""
-    embedding_dir: str = ""
-    opd_output_dir: str = ""
-    ranker_output_dir: str = ""
+    """后训练阶段配置 (Joint Post-train + CF-OPD)"""
+    stages: list = field(default_factory=lambda: ["joint_train", "cf_opd"])
+    fm_checkpoint: str = ""          # 预训练 FM checkpoint
+    joint_checkpoint: str = ""       # joint post-train 后的 checkpoint (cf_opd 阶段用)
+    embedding_dir: str = ""          # 用户 embedding 目录 (cf_opd 阶段用)
+    joint_output_dir: str = ""       # joint 输出目录
+    cf_opd_output_dir: str = ""      # cf_opd 输出目录
 
 
 # ────────────────────────────────────────────────────────────

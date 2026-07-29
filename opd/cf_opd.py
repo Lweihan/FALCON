@@ -198,12 +198,12 @@ class CFOPDEngine:
 
     def __init__(
         self,
-        student,          # LLMStudent (带 LoRA)
-        teacher,          # FMTeacher
-        latent_pipeline,  # LatentPipeline (standardize + encode)
-        ranker,           # 下游 ranker (CVR prediction)
+        student,            # LLMStudent (带 LoRA)
+        teacher,            # FMTeacher (joint post-trained FM)
+        latent_pipeline,    # LatentPipeline (standardize + encode)
+        ranker,             # joint post-trained MACRanker / 旧式 BaseRanker
         cf_config: CFOPDConfig,
-        opd_loss=None,    # 原始 OPDLoss (可选, 用于 combined mode)
+        opd_loss=None,      # 原始 OPDLoss (可选, 用于 combined mode)
         device: str = 'cuda:0',
     ):
         self.student = student
@@ -268,6 +268,11 @@ class CFOPDEngine:
         """
         Step 2-4: 对 N 条候选做 standardize → encode → FM target → ranker 打分。
 
+        CVR 打分路径:
+          - 若 ranker 为 MACRanker (joint post-trained): 用 predict_from_embedding(student_emb)
+            即: FM 预测的未来 embedding → CVR 分, 跳过稀疏特征 lookup
+          - 若 ranker 为旧式 BaseRanker: 用 predict_proba(student_emb)
+
         Args:
             candidate_texts: N 条候选文本
             condition_emb: 当前 condition embedding (1, dim), FM Teacher 用
@@ -277,6 +282,7 @@ class CFOPDEngine:
               'student_embs': Tensor(N, dim),
               'teacher_embs': Tensor(N, dim) or Tensor(1, dim),
               'cvr_scores': Tensor(N,),
+              'rewards': Tensor(N,),
               'sections_list': list of N section dicts,
             }
         """
@@ -300,22 +306,40 @@ class CFOPDEngine:
                     'demand_targets': '',
                 })
 
-        # Step 3: 编码 → fused embedding
+        # Step 3: 编码 → fused embedding (LLM 画像空间)
         student_embs = self.latent_pipeline.encode_text_sections(sections_list).to(self.device)
         # (N, dim)
 
-        # Step 4a: FM Teacher 预测 target embedding
+        # Step 4a: FM Teacher 预测 target embedding (时序演变方向)
         teacher_emb = self.teacher.predict_target_embedding(
             condition_emb, delta_t=0.5,
-        )  # (1, dim) — 广播到 N 条候选
+        )  # (1, dim)
 
-        # Step 4b: Ranker 打分
-        cvr_scores = self.ranker.predict_proba(student_embs).squeeze(-1)  # (N,)
+        # Step 4b: Ranker CVR 打分
+        # MACRanker 提供 predict_from_embedding(), 用融合 embedding 直接打分
+        # (Joint post-train 后, ranker_emb 空间与 FM 空间对齐)
+        if hasattr(self.ranker, "predict_from_embedding"):
+            # Joint-trained MACRanker 路径
+            cvr_scores = self.ranker.predict_from_embedding(student_embs)   # (N,)
+        elif hasattr(self.ranker, "predict_proba"):
+            # 旧式 BaseRanker 路径
+            cvr_scores = self.ranker.predict_proba(student_embs).squeeze(-1)
+        else:
+            # 兜底: 全 0 (不影响 embedding 侧的 reward)
+            cvr_scores = torch.zeros(N, device=self.device)
+
+        # Step 5: 计算组合 reward (embedding 相似度 + CVR)
+        rewards = self.candidate_filter.compute_rewards(
+            student_embs=student_embs,
+            teacher_embs=teacher_emb.expand(N, -1),
+            cvr_scores=cvr_scores,
+        )
 
         return {
             'student_embs': student_embs,
-            'teacher_embs': teacher_emb.expand(N, -1),  # 广播
+            'teacher_embs': teacher_emb.expand(N, -1),
             'cvr_scores': cvr_scores,
+            'rewards': rewards,
             'sections_list': sections_list,
         }
 

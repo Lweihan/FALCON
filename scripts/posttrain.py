@@ -1,273 +1,492 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """
-posttrain.py — FALCON 后训练脚本
-==================================
-后训练阶段完成两件事:
+posttrain.py — FALCON 后训练主脚本
+====================================
+后训练分两个阶段:
 
-  Stage 1 (opd):    OPD 蒸馏 — FM Teacher → LLM Student
-      Teacher 预测 target embedding
-      Student (LLM + LoRA) 生成画像文本 → 编码
-      L = L_gen + α·L_emb + β·L_section + γ·L_kl
-      → final_lora/
+  Stage 1 (joint_train):
+    将预训练 FM + MACRanker 在 alimamaTech/MAC 广告数据集上联合微调。
+    FM 学习 "在 CVR 信号约束下" 优化用户 embedding 的演变方向。
+    Loss = alpha * L_CVR + (1-alpha) * L_flow
 
-  Stage 2 (ranker): 下游 Ranker 训练
-      加载预训练 FM 作为 embedding 优化器
-      Ranker (DNN/DeepFM/DCN/AutoInt/TokenMixer) 联合训练
-      对比: 直接预测 vs FALCON 优化后预测
-      → AUC/GAUC/LogLoss/NDCG 对比报告
+  Stage 2 (cf_opd):
+    用 Stage 1 产出的 joint checkpoint 为 FM Teacher + Ranker,
+    让 LLM (Student) 生成候选用户画像,
+    FM+Ranker 对候选打 CVR 分,
+    高分候选作为正例 / 低分作为负例,
+    DPO 学习使 LLM 生成更高 CVR 潜力的画像。
 
-Usage:
-  # 完整后训练
-  python scripts/posttrain.py \
-      --config configs/falcon_config.yaml \
-      --fm_checkpoint ./output/fm_checkpoints/best_fm.pt \
-      --embedding_dir ./output/embeddings
+使用示例:
 
-  # 仅 OPD 蒸馏
-  python scripts/posttrain.py --stage opd \
-      --fm_checkpoint ./output/fm_checkpoints/best_fm.pt \
-      --embedding_dir ./output/embeddings
+  # 完整后训练 (joint_train → cf_opd)
+  python scripts/posttrain.py \\
+      --config configs/falcon_config.yaml \\
+      --fm_checkpoint ./output/fm_checkpoints/best_fm.pt \\
+      --mac_load_mode hf_streaming \\
+      --mac_label last
 
-  # 仅下游 Ranker (合成数据快速验证)
-  python scripts/posttrain.py --stage ranker \
-      --fm_checkpoint ./output/fm_checkpoints/best_fm.pt \
-      --synthetic --max_samples 20000
+  # 仅 joint 训练 (多卡)
+  torchrun --nproc_per_node=4 scripts/posttrain.py \\
+      --stage joint_train \\
+      --fm_checkpoint ./output/fm_checkpoints/best_fm.pt \\
+      --ranker_type deepfm \\
+      --epochs 3 --batch_size 1024
 
-  # Ranker 消融实验
-  python scripts/posttrain.py --stage ranker \
-      --rankers dnn deepfm token_mixer \
-      --fm_weights 0.1 0.5 1.0
+  # 仅 CF-OPD (已有 joint checkpoint)
+  python scripts/posttrain.py \\
+      --stage cf_opd \\
+      --joint_checkpoint ./output/joint_checkpoints/best_joint.pt \\
+      --embedding_dir ./output/embeddings \\
+      --student_model Qwen/Qwen3-7B
 """
 
 import argparse
 import os
 import sys
 
+# 添加项目根目录到 path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from common.config import FALCONConfig
+from common.config import FALCONConfig, RankerConfig, FMConfig
 from common.logger import get_logger
 from common.utils import set_seed
 
-logger = get_logger("posttrain")
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="FALCON 后训练脚本")
 
-# ════════════════════════════════════════════════════════════
-# Stage 1: OPD 蒸馏
-# ════════════════════════════════════════════════════════════
-
-def run_opd_stage(config: FALCONConfig, args, fm_checkpoint: str) -> str:
-    """
-    FM Teacher → LLM Student 蒸馏。
-
-    Returns:
-        opd_output_dir
-    """
-    from opd.trainer import OPDTrainer
-
-    embedding_dir = (
-        args.embedding_dir
-        or config.posttrain.embedding_dir
-        or os.path.join(config.output_dir, "embeddings")
+    # ── 通用 ──
+    parser.add_argument("--config", default="", help="YAML 配置文件路径")
+    parser.add_argument(
+        "--stage",
+        choices=["joint_train", "cf_opd", "all"],
+        default="all",
+        help="后训练阶段: joint_train / cf_opd / all (默认)",
     )
-    opd_output_dir = (
-        args.opd_output_dir
-        or config.posttrain.opd_output_dir
-        or os.path.join(config.output_dir, "opd_checkpoints")
+    parser.add_argument("--output_dir", default="./output", help="输出根目录")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", default="auto", help="auto / cuda:0 / cpu")
+
+    # ── Joint Post-train ──
+    parser.add_argument("--fm_checkpoint", default="", help="预训练 FM checkpoint 路径")
+    parser.add_argument(
+        "--ranker_type",
+        default="deepfm",
+        choices=["dnn", "deepfm", "dcn", "autoint", "token_mixer"],
+        help="Ranker 类型",
     )
+    parser.add_argument("--epochs", type=int, default=None, help="训练 epoch 数")
+    parser.add_argument("--batch_size", type=int, default=None, help="每 GPU batch 大小")
+    parser.add_argument("--lr", type=float, default=None, help="学习率")
+    parser.add_argument("--joint_alpha", type=float, default=None, help="CVR loss 权重 α")
+    parser.add_argument("--grad_accum", type=int, default=None, help="梯度累积步数")
+    parser.add_argument("--no_amp", action="store_true", help="关闭混合精度")
+    parser.add_argument("--freeze_fm", action="store_true", help="冻结 FM 全部参数")
+    parser.add_argument("--freeze_fm_backbone", action="store_true", help="冻结 FM backbone")
 
-    if not os.path.isfile(fm_checkpoint):
-        raise FileNotFoundError(f"FM checkpoint 不存在: {fm_checkpoint}")
-    if not os.path.isdir(embedding_dir):
-        raise FileNotFoundError(f"Embedding 目录不存在: {embedding_dir}")
-
-    logger.info("=" * 70)
-    logger.info("Stage 1: OPD 蒸馏 (FM Teacher → LLM Student)")
-    logger.info("=" * 70)
-    logger.info(f"  FM checkpoint:   {fm_checkpoint}")
-    logger.info(f"  Embedding 目录:  {embedding_dir}")
-    logger.info(f"  Student 模型:    {config.opd.student_model_path}")
-    logger.info(f"  LoRA rank:       {config.opd.lora_r}")
-    logger.info(f"  蒸馏权重:        α={config.opd.distill_alpha} "
-                f"β={config.opd.distill_beta} γ={config.opd.distill_gamma}")
-    logger.info(f"  输出目录:        {opd_output_dir}")
-
-    device = config.resolve_device()
-    trainer = OPDTrainer(
-        opd_config=config.opd,
-        fm_config=config.fm,
-        latent_config=config.latent,
-        fm_checkpoint=fm_checkpoint,
-        device=device,
+    # ── MAC 数据集 ──
+    parser.add_argument(
+        "--mac_load_mode",
+        default="hf_streaming",
+        choices=["hf_streaming", "hf_download", "local_parquet", "local_csv"],
+        help="MAC 数据集加载模式",
     )
-    trainer.train_offline(data_dir=embedding_dir, output_dir=opd_output_dir)
-
-    return opd_output_dir
-
-
-# ════════════════════════════════════════════════════════════
-# Stage 2: 下游 Ranker 训练
-# ════════════════════════════════════════════════════════════
-
-def run_ranker_stage(config: FALCONConfig, args, fm_checkpoint: str) -> str:
-    """
-    FALCON + Ranker 联合训练与对比评估。
-
-    Returns:
-        ranker_output_dir
-    """
-    from ranker.data import create_ranker_dataloaders
-    from ranker.trainer import RankerTrainer
-
-    ranker_output_dir = (
-        args.ranker_output_dir
-        or config.posttrain.ranker_output_dir
-        or os.path.join(config.output_dir, "ranker_checkpoints")
+    parser.add_argument("--mac_data_path", default="", help="本地 MAC 数据文件路径")
+    parser.add_argument(
+        "--mac_label",
+        default="last",
+        choices=["linear", "mta", "first", "last"],
+        help="CVR 标签字段",
     )
+    parser.add_argument("--mac_vocab_path", default="", help="词表保存/加载路径")
+    parser.add_argument("--mac_max_samples", type=int, default=-1, help="-1=全量; 正数=限制(调试)")
+    parser.add_argument("--mac_val_ratio", type=float, default=0.01, help="val 比例 (streaming)")
 
-    logger.info("=" * 70)
-    logger.info("Stage 2: 下游 Ranker 训练 (FALCON Embedding 优化对比)")
-    logger.info("=" * 70)
-    logger.info(f"  FM checkpoint:   {fm_checkpoint or '(随机初始化)'}")
-    logger.info(f"  Ranker 模型:     {config.ranker.ranker_types}")
-    logger.info(f"  FM 权重消融:     {config.ranker.fm_weights}")
-    logger.info(f"  joint_alpha:     {config.ranker.joint_alpha}")
-    logger.info(f"  freeze_fm:       {config.ranker.freeze_fm}")
-    logger.info(f"  数据源:          "
-                f"{'合成数据' if args.synthetic else config.ranker.data_path or '合成数据'}")
-    logger.info(f"  输出目录:        {ranker_output_dir}")
+    # ── CF-OPD ──
+    parser.add_argument("--joint_checkpoint", default="", help="Joint 后训练的 checkpoint 路径")
+    parser.add_argument("--embedding_dir", default="", help="用户 embedding 目录")
+    parser.add_argument("--student_model", default="", help="LLM Student 模型路径/名称")
+    parser.add_argument("--num_candidates", type=int, default=None, help="每步候选数量")
 
-    device = config.resolve_device()
-
-    train_loader, val_loader, voc_sizes, sparse_features = create_ranker_dataloaders(
-        config.ranker,
-        sparse_features=args.sparse_features,
-        use_synthetic=args.synthetic,
-    )
-
-    trainer = RankerTrainer(
-        ranker_config=config.ranker,
-        fm_config=config.fm,
-        fm_checkpoint=fm_checkpoint if fm_checkpoint and os.path.isfile(fm_checkpoint) else None,
-        device=device,
-    )
-    trainer.run_all(
-        train_loader=train_loader,
-        val_loader=val_loader,
-        feature_voc_sizes=voc_sizes,
-        sparse_features=sparse_features,
-        output_dir=ranker_output_dir,
-    )
-
-    return ranker_output_dir
+    return parser.parse_args()
 
 
-# ════════════════════════════════════════════════════════════
-# 主流程
-# ════════════════════════════════════════════════════════════
+def build_configs(args) -> FALCONConfig:
+    """从 YAML + 命令行参数构建配置。"""
+    if args.config and os.path.isfile(args.config):
+        cfg = FALCONConfig.from_yaml(args.config)
+    else:
+        cfg = FALCONConfig()
 
-def apply_cli_overrides(config: FALCONConfig, args):
-    """命令行参数覆盖配置"""
-    if args.output_dir:
-        config.output_dir = args.output_dir
-    # OPD
-    if args.opd_epochs is not None:
-        config.opd.epochs = args.opd_epochs
-    # Ranker
-    if args.rankers:
-        config.ranker.ranker_types = args.rankers
-    if args.fm_weights:
-        config.ranker.fm_weights = args.fm_weights
-    if args.joint_alpha is not None:
-        config.ranker.joint_alpha = args.joint_alpha
-    if args.freeze_fm:
-        config.ranker.freeze_fm = True
-    if args.ranker_epochs is not None:
-        config.ranker.epochs = args.ranker_epochs
+    # 覆写通用字段
+    cfg.output_dir = args.output_dir
+    cfg.seed = args.seed
+    if args.device != "auto":
+        cfg.device = args.device
+
+    # 覆写 RankerConfig (MAC 相关)
+    rc = cfg.ranker
+    if args.epochs is not None:
+        rc.epochs = args.epochs
     if args.batch_size is not None:
-        config.ranker.batch_size = args.batch_size
-    if args.max_samples is not None:
-        config.ranker.max_samples = args.max_samples
-    if args.data_path:
-        config.ranker.data_path = args.data_path
-    if args.no_fast_train:
-        config.ranker.fast_train = False
+        rc.batch_size = args.batch_size
+    if args.lr is not None:
+        rc.lr = args.lr
+    if args.joint_alpha is not None:
+        rc.joint_alpha = args.joint_alpha
+    if args.grad_accum is not None:
+        rc.grad_accum = args.grad_accum
+    if args.no_amp:
+        rc.use_amp = False
+    if args.freeze_fm:
+        rc.freeze_fm = True
+    if args.freeze_fm_backbone:
+        rc.freeze_fm_backbone = True
 
+    rc.mac_load_mode = args.mac_load_mode
+    if args.mac_data_path:
+        rc.mac_data_path = args.mac_data_path
+    rc.mac_label = args.mac_label
+    if args.mac_vocab_path:
+        rc.mac_vocab_path = args.mac_vocab_path
+    if args.mac_max_samples != -1:
+        rc.mac_max_samples = args.mac_max_samples
+    rc.mac_val_ratio = args.mac_val_ratio
+
+    # PosttrainConfig
+    pc = cfg.posttrain
+    if args.fm_checkpoint:
+        pc.fm_checkpoint = args.fm_checkpoint
+    if args.joint_checkpoint:
+        pc.joint_checkpoint = args.joint_checkpoint
+    if args.embedding_dir:
+        pc.embedding_dir = args.embedding_dir
+
+    # 设置输出目录
+    if not rc.joint_output_dir:
+        rc.joint_output_dir = os.path.join(cfg.output_dir, "joint_checkpoints")
+    if not pc.cf_opd_output_dir:
+        pc.cf_opd_output_dir = os.path.join(cfg.output_dir, "cf_opd_checkpoints")
+    if not pc.embedding_dir:
+        pc.embedding_dir = os.path.join(cfg.output_dir, "embeddings")
+
+    # CFOPDConfig
+    if args.num_candidates is not None:
+        cfg.cf_opd.num_candidates = args.num_candidates
+    if args.student_model:
+        cfg.opd.student_model_name = args.student_model
+
+    return cfg
+
+
+# ════════════════════════════════════════════════════════════
+# Stage 1: Joint Post-train
+# ════════════════════════════════════════════════════════════
+
+def run_joint_train(cfg: FALCONConfig, ranker_type: str, device: str) -> str:
+    """
+    在 MAC 数据集上对 FM + Ranker 进行联合后训练。
+
+    Returns:
+        joint_checkpoint_path: best_joint.pt 路径
+    """
+    from ranker.mac_data import create_mac_dataloaders
+    from ranker.joint_posttrain import JointPostTrainer
+
+    rc = cfg.ranker
+    fc = cfg.fm
+    output_dir = rc.joint_output_dir
+    os.makedirs(output_dir, exist_ok=True)
+
+    print("\n" + "=" * 60)
+    print("Stage 1: Joint Post-train (FM + MACRanker on MAC dataset)")
+    print("=" * 60)
+    print(f"  MAC 加载模式: {rc.mac_load_mode}")
+    print(f"  CVR 标签:    {rc.mac_label}")
+    print(f"  Ranker 类型: {ranker_type}")
+    print(f"  联合 loss:   α={rc.joint_alpha} * L_CVR + {1-rc.joint_alpha:.2f} * L_flow")
+    print(f"  输出目录:    {output_dir}")
+
+    # 加载数据
+    print("\n[1/4] 准备 MAC 数据...")
+    train_loader, val_loader, vocab, feature_info = create_mac_dataloaders(rc)
+    print(f"  词表大小: {sum(feature_info['vocab_sizes'].values()):,}")
+    print(f"  mm_feat 维度: {feature_info['mm_feat_dim']}")
+
+    # 构建 Trainer
+    print("\n[2/4] 初始化 FM + Ranker...")
+    trainer = JointPostTrainer(rc, fc, device=device)
+    trainer.load_fm(cfg.posttrain.fm_checkpoint or None)
+    trainer.build_ranker(ranker_type, feature_info)
+
+    # 训练
+    print(f"\n[3/4] 开始联合训练 ({rc.epochs} epochs)...")
+    joint_ckpt_path = trainer.train(train_loader, val_loader, vocab, output_dir)
+
+    print(f"\n[4/4] Stage 1 完成!")
+    print(f"  Joint checkpoint: {joint_ckpt_path}")
+    return joint_ckpt_path
+
+
+# ════════════════════════════════════════════════════════════
+# Stage 2: CF-OPD
+# ════════════════════════════════════════════════════════════
+
+def run_cf_opd(cfg: FALCONConfig, device: str):
+    """
+    使用 joint post-trained FM + Ranker 对 LLM 做 DPO 学习。
+    """
+    from ranker.joint_posttrain import JointPostTrainer
+    from ranker.models import create_mac_ranker
+
+    pc = cfg.posttrain
+    oc = cfg.opd
+    cf = cfg.cf_opd
+    fc = cfg.fm
+
+    output_dir = pc.cf_opd_output_dir
+    os.makedirs(output_dir, exist_ok=True)
+
+    print("\n" + "=" * 60)
+    print("Stage 2: CF-OPD (LLM DPO via joint FM+Ranker scoring)")
+    print("=" * 60)
+
+    # 加载 joint checkpoint (FM + Ranker)
+    joint_ckpt_path = pc.joint_checkpoint
+    if not joint_ckpt_path or not os.path.isfile(joint_ckpt_path):
+        raise FileNotFoundError(
+            f"CF-OPD 需要 Stage 1 的 joint checkpoint, 未找到: {joint_ckpt_path}\n"
+            "请先运行 Stage 1 (joint_train), 或通过 --joint_checkpoint 指定路径"
+        )
+
+    print(f"[1/5] 加载 joint checkpoint: {joint_ckpt_path}")
+    ckpt = JointPostTrainer.load_joint_checkpoint(joint_ckpt_path, device=device)
+
+    # 重建 FM Teacher
+    from fm.model import FlowMatchingModel
+    fm_model = FlowMatchingModel.from_config(fc).to(device)
+    fm_model.load_state_dict(ckpt["fm_state_dict"])
+    fm_model.eval()
+
+    # 重建 MACRanker
+    # 需要 feature_info — 尝试从 vocab 文件恢复
+    ranker_cfg_dict = ckpt.get("ranker_config", {})
+    rc = cfg.ranker
+    # 用 checkpoint 里的 ranker_config 覆盖当前 rc (保证结构匹配)
+    for k, v in ranker_cfg_dict.items():
+        if hasattr(rc, k):
+            setattr(rc, k, v)
+
+    # 词表 (必须有)
+    if rc.mac_vocab_path and os.path.isfile(rc.mac_vocab_path):
+        from ranker.mac_data import FeatureVocab
+        vocab = FeatureVocab.load(rc.mac_vocab_path)
+        from ranker.mac_data import SPARSE_FIELDS, SEQ_ID_FIELDS, SEQ_FLOAT_FIELDS
+        feature_info = {
+            "vocab_sizes": vocab.vocab_sizes,
+            "sparse_fields": SPARSE_FIELDS,
+            "seq_id_fields": SEQ_ID_FIELDS,
+            "seq_float_fields": SEQ_FLOAT_FIELDS,
+            "mm_feat_dim": ranker_cfg_dict.get("mm_feat_dim", 2),
+            "label_field": rc.mac_label,
+        }
+    else:
+        raise FileNotFoundError(
+            "CF-OPD 需要 vocab 文件来重建 Ranker, 请指定 --mac_vocab_path 或在配置中设置"
+        )
+
+    ranker_type = ranker_cfg_dict.get("ranker_type", "deepfm")
+    ranker = create_mac_ranker(ranker_type, feature_info, rc).to(device)
+    ranker.load_state_dict(ckpt["ranker_state_dict"])
+    ranker.eval()
+    print(f"[2/5] MACRanker ({ranker_type}) 加载完成")
+
+    # 加载 LLM Student
+    print(f"[3/5] 加载 LLM Student: {oc.student_model_name}")
+    from opd.student import LLMStudent
+    student = LLMStudent(oc, device=device)
+
+    # 加载 LatentPipeline
+    from latent.pipeline import LatentPipeline
+    latent_pipeline = LatentPipeline(cfg.latent, device=device)
+
+    # FMTeacher 包装
+    from opd.teacher import FMTeacher
+    teacher = FMTeacher(fm_model, cfg.fm, device=device)
+
+    print(f"[4/5] 初始化 CF-OPD Engine...")
+    from opd.cf_opd import CFOPDEngine
+    engine = CFOPDEngine(
+        student=student,
+        teacher=teacher,
+        latent_pipeline=latent_pipeline,
+        ranker=ranker,
+        cf_config=cf,
+        device=device,
+    )
+
+    # 加载训练数据 (用户 prompt + 对应 condition embedding)
+    print(f"[5/5] 开始 CF-OPD 训练 ...")
+    _run_cf_opd_loop(engine, student, cfg, output_dir, device)
+
+
+def _run_cf_opd_loop(engine, student, cfg, output_dir: str, device: str):
+    """
+    CF-OPD 训练循环。
+
+    数据来源: embedding_dir 下的用户 embedding (预训练阶段产出)
+    每轮:
+      - 从 embedding_dir 加载用户 condition embedding
+      - 用 LLM Student 生成 N 条候选
+      - CF-OPD Engine 打分 → DPO loss
+      - 更新 LLM LoRA 参数
+    """
+    import json
+    import glob
+    from torch.utils.tensorboard import SummaryWriter
+    from torch.optim import AdamW
+
+    cf = cfg.cf_opd
+    pc = cfg.posttrain
+
+    writer = SummaryWriter(log_dir=os.path.join(output_dir, "tensorboard"))
+    optimizer = AdamW(
+        student.trainable_parameters(),
+        lr=cfg.opd.student_lr,
+        weight_decay=1e-5,
+    )
+
+    # 保存 reference model (DPO 需要)
+    engine.save_reference()
+
+    # 读取 condition embedding 文件列表
+    emb_dir = pc.embedding_dir
+    emb_files = sorted(glob.glob(os.path.join(emb_dir, "*.pt")))
+    if not emb_files:
+        emb_files = sorted(glob.glob(os.path.join(emb_dir, "*.npy")))
+    if not emb_files:
+        raise FileNotFoundError(
+            f"未找到用户 embedding 文件: {emb_dir}\n"
+            "请先运行预训练阶段生成 embedding, 或通过 --embedding_dir 指定目录"
+        )
+
+    print(f"  找到 {len(emb_files)} 个 embedding 文件")
+    print(f"  每步候选数: {cf.num_candidates}, 训练模式: {cf.learning_mode}")
+
+    global_step = 0
+    log_history = []
+
+    for epoch in range(1, cfg.opd.epochs + 1):
+        for emb_file in emb_files:
+            # 加载 condition embedding
+            if emb_file.endswith(".pt"):
+                data = torch.load(emb_file, map_location=device)
+                # 支持 dict 格式 {"condition": tensor} 或直接是 tensor
+                if isinstance(data, dict):
+                    cond_emb = data.get("condition", data.get("embedding", None))
+                else:
+                    cond_emb = data
+            else:
+                import numpy as np
+                cond_emb = torch.from_numpy(np.load(emb_file)).to(device)
+
+            if cond_emb is None:
+                continue
+            if cond_emb.dim() == 1:
+                cond_emb = cond_emb.unsqueeze(0)   # (1, dim)
+
+            # 构建 prompt
+            prompt = _build_cf_opd_prompt(emb_file)
+
+            # CF-OPD 单步
+            optimizer.zero_grad(set_to_none=True)
+            step_result = engine.cf_opd_step(
+                prompt_text=prompt,
+                condition_emb=cond_emb,
+                optimizer=optimizer,
+            )
+
+            if step_result.get("skipped"):
+                continue
+
+            global_step += 1
+            loss = step_result.get("loss", 0.0)
+            n_pos = step_result.get("n_positive", 0)
+            n_neg = step_result.get("n_negative", 0)
+
+            writer.add_scalar("step/dpo_loss", loss, global_step)
+            writer.add_scalar("step/n_positive", n_pos, global_step)
+            writer.add_scalar("step/n_negative", n_neg, global_step)
+
+            if global_step % 100 == 0:
+                print(f"  Epoch {epoch} Step {global_step}: "
+                      f"loss={loss:.4f}, pos={n_pos}, neg={n_neg}")
+
+            log_history.append({
+                "epoch": epoch, "step": global_step,
+                "loss": loss, "n_pos": n_pos, "n_neg": n_neg,
+            })
+
+        # 保存每 epoch checkpoint
+        student.save(os.path.join(output_dir, f"student_epoch_{epoch}.pt"))
+        print(f"Epoch {epoch} 完成, checkpoint 已保存")
+
+    # 最终保存
+    student.save(os.path.join(output_dir, "final_student.pt"))
+    writer.close()
+    with open(os.path.join(output_dir, "cf_opd_log.json"), "w") as f:
+        json.dump(log_history, f, indent=2)
+    print(f"CF-OPD 训练完成: {output_dir}")
+
+
+def _build_cf_opd_prompt(emb_file: str) -> str:
+    """
+    根据 embedding 文件名构建 prompt (简单版本)。
+    实际使用时可传入对应的 jsonl 用户历史文本。
+    """
+    basename = os.path.splitext(os.path.basename(emb_file))[0]
+    return (
+        f"请根据用户 {basename} 的历史行为和偏好，"
+        "生成一份全面的用户画像，包含静态信息、兴趣偏好、消费特征和需求意向。"
+    )
+
+
+# ════════════════════════════════════════════════════════════
+# 主入口
+# ════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="FALCON 后训练 (OPD 蒸馏 + 下游 Ranker)",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument("--config", type=str, default="configs/falcon_config.yaml")
-    parser.add_argument(
-        "--stage", type=str, default="all", choices=["opd", "ranker", "all"],
-        help="执行阶段: opd(蒸馏) / ranker(下游) / all(全部)",
-    )
-    # 路径
-    parser.add_argument("--fm_checkpoint", type=str, default=None, help="预训练 FM checkpoint")
-    parser.add_argument("--embedding_dir", type=str, default=None)
-    parser.add_argument("--opd_output_dir", type=str, default=None)
-    parser.add_argument("--ranker_output_dir", type=str, default=None)
-    parser.add_argument("--output_dir", type=str, default=None)
-    # OPD
-    parser.add_argument("--opd_epochs", type=int, default=None)
-    # Ranker
-    parser.add_argument(
-        "--rankers", type=str, nargs="+", default=None,
-        choices=["dnn", "deepfm", "dcn", "autoint", "token_mixer"],
-        help="要训练的 ranker 类型",
-    )
-    parser.add_argument(
-        "--fm_weights", type=float, nargs="+", default=None,
-        help="FM 损失权重消融列表, 如 0.1 0.5 1.0",
-    )
-    parser.add_argument("--joint_alpha", type=float, default=None, help="直接预测损失权重")
-    parser.add_argument("--freeze_fm", action="store_true", help="冻结 FM backbone")
-    parser.add_argument("--ranker_epochs", type=int, default=None)
-    parser.add_argument("--batch_size", type=int, default=None)
-    parser.add_argument("--no_fast_train", action="store_true", help="训练时也走完整 ODE 求解")
-    # 数据
-    parser.add_argument("--data_path", type=str, default=None, help="排序数据集路径")
-    parser.add_argument(
-        "--sparse_features", type=str, nargs="+", default=None,
-        help="稀疏特征列名 (使用真实数据时必填)",
-    )
-    parser.add_argument("--synthetic", action="store_true", help="使用合成数据快速验证")
-    parser.add_argument("--max_samples", type=int, default=None)
-    args = parser.parse_args()
+    args = parse_args()
+    cfg = build_configs(args)
 
-    config = FALCONConfig.from_yaml(args.config)
-    apply_cli_overrides(config, args)
-    set_seed(config.seed)
+    logger = get_logger("posttrain")
+    set_seed(cfg.seed)
 
-    fm_checkpoint = (
-        args.fm_checkpoint
-        or config.posttrain.fm_checkpoint
-        or os.path.join(config.output_dir, "fm_checkpoints", "best_fm.pt")
-    )
+    device = cfg.resolve_device()
+    print(f"设备: {device}")
+    print(f"阶段: {args.stage}")
 
-    logger.info("=" * 70)
-    logger.info("FALCON 后训练")
-    logger.info("=" * 70)
-    logger.info(f"  设备:     {config.resolve_device()}")
-    logger.info(f"  随机种子: {config.seed}")
-    logger.info(f"  执行阶段: {args.stage}")
-    logger.info(f"  Backbone: {config.fm.backbone_type}"
-                + (f" (preset={config.fm.dit_preset})" if config.fm.backbone_type == "dit" else ""))
+    stages = []
+    if args.stage == "all":
+        stages = ["joint_train", "cf_opd"]
+    elif args.stage == "joint_train":
+        stages = ["joint_train"]
+    elif args.stage == "cf_opd":
+        stages = ["cf_opd"]
 
-    stages = ["opd", "ranker"] if args.stage == "all" else [args.stage]
+    joint_ckpt = cfg.posttrain.joint_checkpoint
 
-    if "opd" in stages:
-        opd_dir = run_opd_stage(config, args, fm_checkpoint)
-        logger.info(f"OPD 蒸馏完成: {opd_dir}")
+    if "joint_train" in stages:
+        joint_ckpt = run_joint_train(cfg, args.ranker_type, device)
+        # 自动把 joint_ckpt 传给 cf_opd
+        cfg.posttrain.joint_checkpoint = joint_ckpt
 
-    if "ranker" in stages:
-        ranker_dir = run_ranker_stage(config, args, fm_checkpoint)
-        logger.info(f"Ranker 训练完成: {ranker_dir}")
+    if "cf_opd" in stages:
+        if joint_ckpt:
+            cfg.posttrain.joint_checkpoint = joint_ckpt
+        run_cf_opd(cfg, device)
 
-    logger.info("")
-    logger.info("后训练全部完成")
+    print("\n后训练全部完成!")
 
 
 if __name__ == "__main__":
