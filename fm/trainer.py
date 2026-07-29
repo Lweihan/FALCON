@@ -201,28 +201,41 @@ class FMTrainer:
             lr = scheduler.get_last_lr()[0]
 
             train_loss = train_stats["avg_loss"]
-            val_loss = val_stats.get("avg_loss", ema_val if ema_val is not None else 0.0)
-            val_cos = val_stats.get("avg_cos_sim", 0.0)
+            has_val = bool(val_stats)           # 本 epoch 是否真的跑了验证
+            val_loss = val_stats.get("avg_loss") if has_val else None
+            val_cos = val_stats.get("avg_cos_sim") if has_val else None
 
-            # EMA
+            # EMA train loss: 每 epoch 更新
             if ema_train is None:
-                ema_train, ema_val = train_loss, val_loss
+                ema_train = train_loss
             else:
                 ema_train = alpha * train_loss + (1 - alpha) * ema_train
-                ema_val = alpha * val_loss + (1 - alpha) * ema_val
 
-            self._log(
-                f"Epoch {epoch}/{cfg.epochs} ({elapsed:.1f}s) | "
-                f"train={train_loss:.6f} (ema={ema_train:.6f}) | "
-                f"val={val_loss:.6f} (ema={ema_val:.6f}) | "
-                f"cos={val_cos:.4f} | lr={lr:.2e}"
-            )
+            # EMA val loss: 仅在真正做了验证时更新, 否则沿用上一次值
+            if val_loss is not None:
+                if ema_val is None:
+                    ema_val = val_loss
+                else:
+                    ema_val = alpha * val_loss + (1 - alpha) * ema_val
 
+            # 日志: val/cos 仅在有验证时打印
+            if has_val:
+                self._log(
+                    f"Epoch {epoch}/{cfg.epochs} ({elapsed:.1f}s) | "
+                    f"train={train_loss:.6f} (ema={ema_train:.6f}) | "
+                    f"val={val_loss:.6f} (ema={ema_val:.6f}) | "
+                    f"cos={val_cos:.4f} | lr={lr:.2e}"
+                )
+            else:
+                self._log(
+                    f"Epoch {epoch}/{cfg.epochs} ({elapsed:.1f}s) | "
+                    f"train={train_loss:.6f} (ema={ema_train:.6f}) | "
+                    f"[val skipped] | lr={lr:.2e}"
+                )
+
+            # TensorBoard: train 每 epoch 写; val/cos 仅有数据时写, 避免空值点
             writer.add_scalar("epoch/train_loss", train_loss, epoch)
-            writer.add_scalar("epoch/val_loss", val_loss, epoch)
             writer.add_scalar("epoch/ema_train_loss", ema_train, epoch)
-            writer.add_scalar("epoch/ema_val_loss", ema_val, epoch)
-            writer.add_scalar("epoch/val_cosine_sim", val_cos, epoch)
             writer.add_scalar("epoch/lr", lr, epoch)
             writer.add_scalar("epoch/mse_raw", train_stats["avg_mse_raw"], epoch)
             writer.add_scalar("epoch/mse_weighted", train_stats["avg_mse_weighted"], epoch)
@@ -230,6 +243,11 @@ class FMTrainer:
             writer.add_scalar("perf/epoch_seconds", elapsed, epoch)
             writer.add_scalar("perf/samples_per_sec",
                               n_train / max(elapsed, 1e-6), epoch)
+            if has_val:
+                writer.add_scalar("epoch/val_loss", val_loss, epoch)
+                writer.add_scalar("epoch/val_cosine_sim", val_cos, epoch)
+                if ema_val is not None:
+                    writer.add_scalar("epoch/ema_val_loss", ema_val, epoch)
 
             log_history.append({
                 "epoch": epoch, "train_loss": train_loss, "ema_train_loss": ema_train,
@@ -240,9 +258,9 @@ class FMTrainer:
                 "lr": lr, "seconds": elapsed,
             })
 
-            # 保存 (仅主进程)
+            # 保存 (仅主进程); 只在有真实验证值时才判断是否为最佳
             if self.is_main:
-                if ema_val < best_val:
+                if has_val and ema_val is not None and ema_val < best_val:
                     best_val = ema_val
                     save_checkpoint(
                         os.path.join(output_dir, "best_fm.pt"),
@@ -255,7 +273,7 @@ class FMTrainer:
                 if epoch % cfg.save_every == 0:
                     save_checkpoint(
                         os.path.join(output_dir, f"fm_epoch_{epoch}.pt"),
-                        self.raw_model, optimizer, epoch=epoch, loss=val_loss,
+                        self.raw_model, optimizer, epoch=epoch, loss=train_loss,
                     )
             barrier()
 
