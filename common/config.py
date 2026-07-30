@@ -279,6 +279,14 @@ class RankerConfig:
     grad_accum: int = 4
     use_amp: bool = True
     save_every: int = 1
+    # ── DDP 多卡 ──
+    # distributed 由 torchrun 环境变量自动检测, 无需手动设置
+    distributed: bool = False
+    # find_unused_parameters: auto / true / false
+    #   auto: freeze_fm 或 freeze_fm_backbone 开启时自动为 true
+    #   (冻结部分参数时 DDP 会因"期待的梯度未到达"报错, 必须开启;
+    #    但开启有性能损失, 故按需决定)
+    ddp_find_unused_parameters: str = "auto"
     # 数据 (通用)
     data_path: str = ""
     max_samples: int = -1

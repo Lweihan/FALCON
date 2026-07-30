@@ -454,53 +454,108 @@ def _load_local_iter(path: str, fmt: str = "parquet"):
 
 class ParquetDirIterable:
     """
-    可重复迭代的 parquet 目录流式读取器。
+    可重复迭代的 parquet 目录流式读取器, 支持 DDP 按 rank 切分。
 
     逐文件、逐行组 (row group batch) 读取, 避免一次性加载数十 GB 到内存。
     实现 __iter__ 使其可被多个 epoch 重复遍历 (普通 generator 只能迭代一次)。
 
+    DDP 切分策略 (IterableDataset 无法使用 DistributedSampler, 必须自己切):
+      策略 A — 文件级切分 (文件数 >= world_size, I/O 最优):
+        files[rank::world_size], 每卡只读自己那批文件, I/O 真正并行
+      策略 B — 行级切分 (文件数 < world_size, 退化方案):
+        每卡读全部文件但按 idx % world_size == rank 取行
+        (I/O 无法并行, 但保证数据不重复)
+
     用法:
-        it = ParquetDirIterable("/data/MAC/train", batch_size=10000)
+        it = ParquetDirIterable("/data/MAC/train", batch_size=10000,
+                                rank=0, world_size=4)
         for row in it:   # row 是 dict
             ...
     """
 
-    def __init__(self, dir_path: str, batch_size: int = 10000, columns: Optional[List[str]] = None):
+    def __init__(
+        self,
+        dir_path: str,
+        batch_size: int = 10000,
+        columns: Optional[List[str]] = None,
+        rank: int = 0,
+        world_size: int = 1,
+        name: str = "",
+    ):
         import glob as _glob
 
         self.dir_path = dir_path
         self.batch_size = batch_size
         self.columns = columns
+        self.rank = max(rank, 0)
+        self.world_size = max(world_size, 1)
 
         if not os.path.isdir(dir_path):
             raise FileNotFoundError(f"数据目录不存在: {dir_path}")
 
-        self.files = sorted(_glob.glob(os.path.join(dir_path, "*.parquet")))
-        if not self.files:
+        all_files = sorted(_glob.glob(os.path.join(dir_path, "*.parquet")))
+        if not all_files:
             # 兼容 snappy 后缀等变体
-            self.files = sorted(
+            all_files = sorted(
                 p for p in _glob.glob(os.path.join(dir_path, "*"))
                 if p.endswith((".parquet", ".pq"))
             )
-        if not self.files:
+        if not all_files:
             raise FileNotFoundError(f"目录下未找到 parquet 文件: {dir_path}")
 
-        logger.info(f"parquet 目录: {dir_path} ({len(self.files)} 个文件)")
+        self.all_files = all_files
 
-    def num_rows(self) -> int:
-        """统计总行数 (只读 metadata, 很快)。"""
+        # ── DDP 切分 ──
+        if self.world_size <= 1:
+            self.files = all_files
+            self._row_level_split = False
+        elif len(all_files) >= self.world_size:
+            # 策略 A: 文件级切分
+            self.files = all_files[self.rank::self.world_size]
+            self._row_level_split = False
+        else:
+            # 策略 B: 行级切分
+            self.files = all_files
+            self._row_level_split = True
+
+        tag = f"[{name}] " if name else ""
+        if self.world_size > 1:
+            mode = "行级" if self._row_level_split else "文件级"
+            logger.info(
+                f"{tag}parquet 目录: {dir_path} "
+                f"(全局 {len(all_files)} 文件, rank {self.rank}/{self.world_size} "
+                f"分到 {len(self.files)} 文件, {mode}切分)"
+            )
+        else:
+            logger.info(f"{tag}parquet 目录: {dir_path} ({len(all_files)} 个文件)")
+
+    def num_rows(self, local_only: bool = True) -> int:
+        """
+        统计行数 (只读 metadata, 很快)。
+
+        Args:
+            local_only: True 返回本 rank 实际会读的行数;
+                        False 返回全局总行数
+        """
         import pyarrow.parquet as pq
+
+        files = self.files if local_only else self.all_files
         total = 0
-        for f in self.files:
+        for f in files:
             try:
                 total += pq.ParquetFile(f).metadata.num_rows
             except Exception:
                 pass
+
+        # 行级切分下, 本 rank 只取 1/world_size 的行
+        if local_only and self._row_level_split:
+            total = total // self.world_size
         return total
 
     def __iter__(self) -> Iterator[dict]:
         import pyarrow.parquet as pq
 
+        idx = 0
         for fpath in self.files:
             try:
                 pf = pq.ParquetFile(fpath)
@@ -511,7 +566,12 @@ class ParquetDirIterable:
             for batch in pf.iter_batches(batch_size=self.batch_size, columns=self.columns):
                 # RecordBatch → list of dict
                 for row in batch.to_pylist():
+                    if self._row_level_split:
+                        if idx % self.world_size != self.rank:
+                            idx += 1
+                            continue
                     yield row
+                    idx += 1
 
 
 def build_vocab_from_mac(
@@ -611,6 +671,11 @@ def create_mac_dataloaders(
     load_mode = cfg.mac_load_mode
     label = cfg.mac_label
 
+    # ── DDP: 训练集按 rank 切分 ──
+    from common.distributed import get_rank, get_world_size, is_main_process
+    rank, world_size = get_rank(), get_world_size()
+    is_main = is_main_process()
+
     # ════════════════════════════════════════════════
     # local_dir 模式 (推荐)
     # ════════════════════════════════════════════════
@@ -625,10 +690,12 @@ def create_mac_dataloaders(
         val_dir = _resolve_subdir(root, cfg.mac_val_subdir, ["test", "val", "valid"])
         vocab_dir = _resolve_subdir(root, cfg.mac_vocab_subdir, ["vocabs", "vocab"])
 
-        logger.info(f"MAC local_dir 模式: {root}")
-        logger.info(f"  train: {train_dir}")
-        logger.info(f"  eval:  {val_dir}")
-        logger.info(f"  vocab: {vocab_dir}")
+        if is_main:
+            logger.info(f"MAC local_dir 模式: {root}"
+                        + (f" (DDP world_size={world_size})" if world_size > 1 else ""))
+            logger.info(f"  train: {train_dir}")
+            logger.info(f"  eval:  {val_dir}")
+            logger.info(f"  vocab: {vocab_dir}")
 
         # ── 词表: 优先读 vocabs/ 目录 ──
         if vocab is None:
@@ -651,13 +718,27 @@ def create_mac_dataloaders(
                 )
 
         # ── 数据迭代器 ──
-        train_src = ParquetDirIterable(train_dir, batch_size=cfg.mac_parquet_batch_size)
-        val_src = ParquetDirIterable(val_dir, batch_size=cfg.mac_parquet_batch_size)
+        # 训练集按 rank 切分 (DDP 数据并行);
+        # 验证集不切分 — 各 rank 读完整验证集算指标后 all_reduce 取平均。
+        #   原因: 验证集限制在 10 万条以内, 重复计算开销可接受;
+        #   且切分后可能出现某 rank 拿到全负样本 → AUC 无定义
+        train_src = ParquetDirIterable(
+            train_dir, batch_size=cfg.mac_parquet_batch_size,
+            rank=rank, world_size=world_size, name="train",
+        )
+        val_src = ParquetDirIterable(
+            val_dir, batch_size=cfg.mac_parquet_batch_size,
+            rank=0, world_size=1, name="eval",   # 不切分
+        )
 
         # 打印规模 (只读 metadata)
         try:
-            logger.info(f"  train 总行数: {train_src.num_rows():,}")
-            logger.info(f"  val   总行数: {val_src.num_rows():,}")
+            if world_size > 1:
+                logger.info(f"  train 全局行数: {train_src.num_rows(local_only=False):,}"
+                            f", 本 rank: {train_src.num_rows():,}")
+            else:
+                logger.info(f"  train 总行数: {train_src.num_rows():,}")
+            logger.info(f"  eval  总行数: {val_src.num_rows():,} (各 rank 均读完整验证集)")
         except Exception:
             pass
 
@@ -686,6 +767,14 @@ def create_mac_dataloaders(
                 )
 
         if load_mode in ("hf_streaming", "hf_download"):
+            if world_size > 1:
+                raise RuntimeError(
+                    f"{load_mode} 模式不支持 DDP 多卡 (world_size={world_size})。\n"
+                    "HuggingFace streaming 的 IterableDataset 无法按 rank 切分, "
+                    "各卡会读到完全相同的数据 → 无加速且梯度重复。\n"
+                    "请改用 local_dir 模式 (先把数据集下载到本地 MAC/{train,test,vocabs}/), "
+                    "或去掉 torchrun 用单卡运行。"
+                )
             streaming = (load_mode == "hf_streaming")
             train_src = _load_hf_iter("train", streaming=streaming)
             val_src = _load_hf_iter("test", streaming=streaming)
@@ -696,16 +785,22 @@ def create_mac_dataloaders(
             all_rows = _load_local_iter(cfg.mac_data_path, fmt)
             n_total = len(all_rows)
             n_train = int(n_total * (1 - cfg.mac_val_ratio))
-            train_src = all_rows[:n_train]
+            train_rows = all_rows[:n_train]
             val_src = all_rows[n_train:]
             n_val = len(val_src)
+            # list 可直接按 rank 切片 (验证集不切)
+            train_src = train_rows[rank::world_size] if world_size > 1 else train_rows
+            if world_size > 1:
+                logger.info(f"  rank {rank}/{world_size}: "
+                            f"train {len(train_src):,}/{len(train_rows):,} 行")
 
         mm_feat_dim = _detect_mm_feat_dim(load_mode, cfg.mac_data_path)
 
         train_max = cfg.mac_max_samples if cfg.mac_max_samples > 0 else -1
         val_max = min(n_val, cfg.mac_val_max_samples) if n_val > 0 else cfg.mac_val_max_samples
 
-    logger.info(f"mm_feat 合并维度: {mm_feat_dim}")
+    if is_main:
+        logger.info(f"mm_feat 合并维度: {mm_feat_dim}")
 
     # ── 构建 Dataset ──
     ds_kwargs = dict(
@@ -722,16 +817,17 @@ def create_mac_dataloaders(
         val_src, vocab, max_samples=val_max, **ds_kwargs
     )
 
-    logger.info(f"标签口径: mode={cfg.mac_label_mode}, field={label}, "
-                f"threshold={cfg.mac_label_threshold}")
+    if is_main:
+        logger.info(f"标签口径: mode={cfg.mac_label_mode}, field={label}, "
+                    f"threshold={cfg.mac_label_threshold}")
 
-    # 标签分布探测会消耗迭代器: 只对可重复迭代的源做
-    # (ParquetDirIterable 实现了 __iter__ 可重复; HF streaming 的 IterableDataset
-    #  一旦消耗就取不回来, 跳过以免训练少样本)
-    if isinstance(train_src, (ParquetDirIterable, list, tuple)):
-        _log_label_stats(train_src, label, cfg.mac_label_mode, cfg.mac_label_threshold)
-    else:
-        logger.info("(streaming 源跳过标签分布探测, 避免消耗数据流)")
+        # 标签分布探测会消耗迭代器: 只对可重复迭代的源做
+        # (ParquetDirIterable 实现了 __iter__ 可重复; HF streaming 的 IterableDataset
+        #  一旦消耗就取不回来, 跳过以免训练少样本)
+        if isinstance(train_src, (ParquetDirIterable, list, tuple)):
+            _log_label_stats(train_src, label, cfg.mac_label_mode, cfg.mac_label_threshold)
+        else:
+            logger.info("(streaming 源跳过标签分布探测, 避免消耗数据流)")
 
 
     # IterableDataset 用多 worker 会导致数据重复, 固定为 0
@@ -757,6 +853,8 @@ def create_mac_dataloaders(
         "label_field": label,
         "label_mode": cfg.mac_label_mode,
         "label_threshold": cfg.mac_label_threshold,
+        "world_size": world_size,
+        "rank": rank,
     }
 
     return train_loader, val_loader, vocab, feature_info

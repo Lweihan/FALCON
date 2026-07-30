@@ -18,32 +18,40 @@ posttrain.py — FALCON 后训练主脚本
 
 使用示例:
 
-  # 完整后训练 (joint_train → cf_opd)
+  # 单卡完整后训练 (joint_train → cf_opd)
   python scripts/posttrain.py \\
       --config configs/falcon_config.yaml \\
       --fm_checkpoint ./output/fm_checkpoints/best_fm.pt \\
       --mac_data_path /path/to/MAC \\
       --mac_label last
 
-  # 仅 joint 训练 (多卡)
+  # 多卡 Joint Post-train (4 卡 DDP)
+  # 注: --batch_size 是「每卡」大小; 或用 --global_batch_size 自动换算
   torchrun --nproc_per_node=4 scripts/posttrain.py \\
       --stage joint_train \\
       --fm_checkpoint ./output/fm_checkpoints/best_fm.pt \\
       --mac_data_path /path/to/MAC \\
       --ranker_type deepfm \\
-      --epochs 3 --batch_size 1024
+      --global_batch_size 4096 --epochs 3
 
   # 调试 (只读 1000 条)
   python scripts/posttrain.py --stage joint_train \\
-      --mac_data_path /path/to/MAC --mac_max_samples 1000
+      --mac_data_path /path/to/MAC --mac_max_samples 1000 --epochs 1
 
-  # 仅 CF-OPD (已有 joint checkpoint)
+  # 仅 CF-OPD (已有 joint checkpoint; 只支持单卡)
   python scripts/posttrain.py \\
       --stage cf_opd \\
       --joint_checkpoint ./output/joint_checkpoints/best_joint.pt \\
       --mac_data_path /path/to/MAC \\
       --embedding_dir ./output/embeddings \\
       --student_model Qwen/Qwen3-7B
+
+多卡支持说明:
+  Stage 1 (joint_train)  支持 DDP; 要求 mac_load_mode=local_dir
+                         (HF streaming 无法按 rank 切分数据)
+  Stage 2 (cf_opd)       暂不支持多卡, 多卡启动时自动只在 rank 0 执行。
+                         原因: LLM 候选生成是串行自回归采样, 需推理并行
+                         (如 vLLM) 而非数据并行。
 
 MAC 目录结构 (local_dir 模式, 默认):
   MAC/
@@ -89,6 +97,8 @@ def parse_args():
     )
     parser.add_argument("--epochs", type=int, default=None, help="训练 epoch 数")
     parser.add_argument("--batch_size", type=int, default=None, help="每 GPU batch 大小")
+    parser.add_argument("--global_batch_size", type=int, default=None,
+                        help="全局 batch 大小; 自动换算每卡 = global / (world_size * grad_accum)")
     parser.add_argument("--lr", type=float, default=None, help="学习率")
     parser.add_argument("--joint_alpha", type=float, default=None, help="CVR loss 权重 α")
     parser.add_argument("--grad_accum", type=int, default=None, help="梯度累积步数")
@@ -163,14 +173,24 @@ def build_configs(args) -> FALCONConfig:
     rc = cfg.ranker
     if args.epochs is not None:
         rc.epochs = args.epochs
-    if args.batch_size is not None:
+    if args.grad_accum is not None:
+        rc.grad_accum = args.grad_accum
+
+    # batch size: global 优先于 per-GPU
+    if args.global_batch_size is not None:
+        from common.distributed import get_world_size
+        ws = get_world_size()
+        accum = max(rc.grad_accum, 1)
+        per_gpu = max(args.global_batch_size // (ws * accum), 1)
+        rc.batch_size = per_gpu
+        print(f"global_batch_size={args.global_batch_size} → "
+              f"每卡 batch={per_gpu} (world_size={ws}, grad_accum={accum})")
+    elif args.batch_size is not None:
         rc.batch_size = args.batch_size
     if args.lr is not None:
         rc.lr = args.lr
     if args.joint_alpha is not None:
         rc.joint_alpha = args.joint_alpha
-    if args.grad_accum is not None:
-        rc.grad_accum = args.grad_accum
     if args.no_amp:
         rc.use_amp = False
     if args.freeze_fm:
@@ -233,49 +253,69 @@ def build_configs(args) -> FALCONConfig:
 # Stage 1: Joint Post-train
 # ════════════════════════════════════════════════════════════
 
-def run_joint_train(cfg: FALCONConfig, ranker_type: str, device: str) -> str:
+def run_joint_train(
+    cfg: FALCONConfig,
+    ranker_type: str,
+    device: str,
+    distributed: bool = False,
+    local_rank: int = 0,
+) -> str:
     """
-    在 MAC 数据集上对 FM + Ranker 进行联合后训练。
+    在 MAC 数据集上对 FM + Ranker 进行联合后训练。支持 DDP 多卡。
 
     Returns:
         joint_checkpoint_path: best_joint.pt 路径
     """
     from ranker.mac_data import create_mac_dataloaders
     from ranker.joint_posttrain import JointPostTrainer
+    from common.distributed import is_main_process, get_world_size, barrier
 
     rc = cfg.ranker
     fc = cfg.fm
     output_dir = rc.joint_output_dir
-    os.makedirs(output_dir, exist_ok=True)
+    is_main = is_main_process()
+    world_size = get_world_size()
 
-    print("\n" + "=" * 60)
-    print("Stage 1: Joint Post-train (FM + MACRanker on MAC dataset)")
-    print("=" * 60)
-    print(f"  MAC 加载模式: {rc.mac_load_mode}")
-    print(f"  CVR 标签:    {rc.mac_label} (mode={rc.mac_label_mode}, "
-          f"threshold={rc.mac_label_threshold})")
-    print(f"  Ranker 类型: {ranker_type}")
-    print(f"  联合 loss:   α={rc.joint_alpha} * L_CVR + {1-rc.joint_alpha:.2f} * L_flow")
-    print(f"  输出目录:    {output_dir}")
+    if is_main:
+        os.makedirs(output_dir, exist_ok=True)
+    barrier()
+
+    def _p(*a):
+        if is_main:
+            print(*a)
+
+    _p("\n" + "=" * 60)
+    _p("Stage 1: Joint Post-train (FM + MACRanker on MAC dataset)")
+    _p("=" * 60)
+    if world_size > 1:
+        _p(f"  DDP:         {world_size} 卡")
+    _p(f"  MAC 加载模式: {rc.mac_load_mode}")
+    _p(f"  CVR 标签:    {rc.mac_label} (mode={rc.mac_label_mode}, "
+       f"threshold={rc.mac_label_threshold})")
+    _p(f"  Ranker 类型: {ranker_type}")
+    _p(f"  联合 loss:   α={rc.joint_alpha} * L_CVR + {1-rc.joint_alpha:.2f} * L_flow")
+    _p(f"  输出目录:    {output_dir}")
 
     # 加载数据
-    print("\n[1/4] 准备 MAC 数据...")
+    _p("\n[1/4] 准备 MAC 数据...")
     train_loader, val_loader, vocab, feature_info = create_mac_dataloaders(rc)
-    print(f"  词表大小: {sum(feature_info['vocab_sizes'].values()):,}")
-    print(f"  mm_feat 维度: {feature_info['mm_feat_dim']}")
+    _p(f"  词表大小: {sum(feature_info['vocab_sizes'].values()):,}")
+    _p(f"  mm_feat 维度: {feature_info['mm_feat_dim']}")
 
     # 构建 Trainer
-    print("\n[2/4] 初始化 FM + Ranker...")
-    trainer = JointPostTrainer(rc, fc, device=device)
+    _p("\n[2/4] 初始化 FM + Ranker...")
+    trainer = JointPostTrainer(
+        rc, fc, device=device, distributed=distributed, local_rank=local_rank,
+    )
     trainer.load_fm(cfg.posttrain.fm_checkpoint or None)
     trainer.build_ranker(ranker_type, feature_info)
 
     # 训练
-    print(f"\n[3/4] 开始联合训练 ({rc.epochs} epochs)...")
+    _p(f"\n[3/4] 开始联合训练 ({rc.epochs} epochs)...")
     joint_ckpt_path = trainer.train(train_loader, val_loader, vocab, output_dir)
 
-    print(f"\n[4/4] Stage 1 完成!")
-    print(f"  Joint checkpoint: {joint_ckpt_path}")
+    _p(f"\n[4/4] Stage 1 完成!")
+    _p(f"  Joint checkpoint: {joint_ckpt_path}")
     return joint_ckpt_path
 
 
@@ -521,15 +561,31 @@ def _build_cf_opd_prompt(emb_file: str) -> str:
 # ════════════════════════════════════════════════════════════
 
 def main():
+    # ── 分布式初始化 (必须在 build_configs 之前, 因为 global_batch_size 要用 world_size) ──
+    from common.distributed import (
+        setup_distributed, cleanup_distributed, is_distributed_env,
+        is_main_process, barrier, get_world_size,
+    )
+    from common.distributed import setup_performance_flags
+
+    is_dist, rank, world_size, local_rank, dist_device = (
+        setup_distributed() if is_distributed_env() else (False, 0, 1, 0, None)
+    )
+
     args = parse_args()
     cfg = build_configs(args)
 
     logger = get_logger("posttrain")
-    set_seed(cfg.seed)
+    set_seed(cfg.seed + rank)   # 各 rank 不同种子, 避免 dropout 等完全同步
 
-    device = cfg.resolve_device()
-    print(f"设备: {device}")
-    print(f"阶段: {args.stage}")
+    device = dist_device if is_dist else cfg.resolve_device()
+    setup_performance_flags(use_tf32=True, cudnn_benchmark=True)
+
+    if is_main_process():
+        print(f"设备: {device}")
+        print(f"阶段: {args.stage}")
+        if is_dist:
+            print(f"DDP: world_size={world_size}")
 
     stages = []
     if args.stage == "all":
@@ -541,17 +597,38 @@ def main():
 
     joint_ckpt = cfg.posttrain.joint_checkpoint
 
-    if "joint_train" in stages:
-        joint_ckpt = run_joint_train(cfg, args.ranker_type, device)
-        # 自动把 joint_ckpt 传给 cf_opd
-        cfg.posttrain.joint_checkpoint = joint_ckpt
-
-    if "cf_opd" in stages:
-        if joint_ckpt:
+    try:
+        if "joint_train" in stages:
+            joint_ckpt = run_joint_train(
+                cfg, args.ranker_type, device,
+                distributed=is_dist, local_rank=local_rank,
+            )
             cfg.posttrain.joint_checkpoint = joint_ckpt
-        run_cf_opd(cfg, device)
 
-    print("\n后训练全部完成!")
+        if "cf_opd" in stages:
+            if joint_ckpt:
+                cfg.posttrain.joint_checkpoint = joint_ckpt
+
+            # CF-OPD 暂不支持多卡: LLM 候选生成是串行自回归采样,
+            # 需要的是推理并行 (vLLM) 而非数据并行。多卡时只在 rank 0 执行。
+            if world_size > 1:
+                if is_main_process():
+                    logger.warning(
+                        f"CF-OPD 暂不支持多卡 (world_size={world_size}), "
+                        "只在 rank 0 执行; 其余 rank 直接退出。\n"
+                        "如需单独运行 CF-OPD, 建议不加 torchrun 直接 python 启动。"
+                    )
+                barrier()
+                if is_main_process():
+                    run_cf_opd(cfg, device)
+            else:
+                run_cf_opd(cfg, device)
+
+        if is_main_process():
+            print("\n后训练全部完成!")
+    finally:
+        if is_dist:
+            cleanup_distributed()
 
 
 if __name__ == "__main__":
