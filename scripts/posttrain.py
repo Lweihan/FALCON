@@ -22,22 +22,34 @@ posttrain.py — FALCON 后训练主脚本
   python scripts/posttrain.py \\
       --config configs/falcon_config.yaml \\
       --fm_checkpoint ./output/fm_checkpoints/best_fm.pt \\
-      --mac_load_mode hf_streaming \\
+      --mac_data_path /path/to/MAC \\
       --mac_label last
 
   # 仅 joint 训练 (多卡)
   torchrun --nproc_per_node=4 scripts/posttrain.py \\
       --stage joint_train \\
       --fm_checkpoint ./output/fm_checkpoints/best_fm.pt \\
+      --mac_data_path /path/to/MAC \\
       --ranker_type deepfm \\
       --epochs 3 --batch_size 1024
+
+  # 调试 (只读 1000 条)
+  python scripts/posttrain.py --stage joint_train \\
+      --mac_data_path /path/to/MAC --mac_max_samples 1000
 
   # 仅 CF-OPD (已有 joint checkpoint)
   python scripts/posttrain.py \\
       --stage cf_opd \\
       --joint_checkpoint ./output/joint_checkpoints/best_joint.pt \\
+      --mac_data_path /path/to/MAC \\
       --embedding_dir ./output/embeddings \\
       --student_model Qwen/Qwen3-7B
+
+MAC 目录结构 (local_dir 模式, 默认):
+  MAC/
+  ├── train/   *.parquet
+  ├── val/     *.parquet
+  └── vocab/   {field}.json
 """
 
 import argparse
@@ -87,20 +99,30 @@ def parse_args():
     # ── MAC 数据集 ──
     parser.add_argument(
         "--mac_load_mode",
-        default="hf_streaming",
-        choices=["hf_streaming", "hf_download", "local_parquet", "local_csv"],
-        help="MAC 数据集加载模式",
+        default="local_dir",
+        choices=["local_dir", "hf_streaming", "hf_download", "local_parquet", "local_csv"],
+        help="MAC 数据集加载模式 (local_dir 推荐: 需 train/ val/ vocab/ 子目录)",
     )
-    parser.add_argument("--mac_data_path", default="", help="本地 MAC 数据文件路径")
+    parser.add_argument("--mac_data_path", default="",
+                        help="local_dir: MAC 根目录; local_parquet/csv: 单文件路径")
+    parser.add_argument("--mac_train_subdir", default="train", help="训练数据子目录")
+    parser.add_argument("--mac_val_subdir", default="val", help="验证数据子目录")
+    parser.add_argument("--mac_vocab_subdir", default="vocab", help="词表子目录")
+    parser.add_argument("--mac_parquet_batch_size", type=int, default=None,
+                        help="parquet 流式读取行组大小 (默认 10000)")
     parser.add_argument(
         "--mac_label",
         default="last",
         choices=["linear", "mta", "first", "last"],
         help="CVR 标签字段",
     )
-    parser.add_argument("--mac_vocab_path", default="", help="词表保存/加载路径")
+    parser.add_argument("--mac_vocab_path", default="",
+                        help="独立词表 json 路径 (非 local_dir 模式)")
     parser.add_argument("--mac_max_samples", type=int, default=-1, help="-1=全量; 正数=限制(调试)")
-    parser.add_argument("--mac_val_ratio", type=float, default=0.01, help="val 比例 (streaming)")
+    parser.add_argument("--mac_val_max_samples", type=int, default=None,
+                        help="val 最多读取样本数 (默认 100000)")
+    parser.add_argument("--mac_val_ratio", type=float, default=0.01,
+                        help="val 比例 (仅非 local_dir 模式生效)")
 
     # ── CF-OPD ──
     parser.add_argument("--joint_checkpoint", default="", help="Joint 后训练的 checkpoint 路径")
@@ -146,11 +168,18 @@ def build_configs(args) -> FALCONConfig:
     rc.mac_load_mode = args.mac_load_mode
     if args.mac_data_path:
         rc.mac_data_path = args.mac_data_path
+    rc.mac_train_subdir = args.mac_train_subdir
+    rc.mac_val_subdir = args.mac_val_subdir
+    rc.mac_vocab_subdir = args.mac_vocab_subdir
+    if args.mac_parquet_batch_size is not None:
+        rc.mac_parquet_batch_size = args.mac_parquet_batch_size
     rc.mac_label = args.mac_label
     if args.mac_vocab_path:
         rc.mac_vocab_path = args.mac_vocab_path
     if args.mac_max_samples != -1:
         rc.mac_max_samples = args.mac_max_samples
+    if args.mac_val_max_samples is not None:
+        rc.mac_val_max_samples = args.mac_val_max_samples
     rc.mac_val_ratio = args.mac_val_ratio
 
     # PosttrainConfig
@@ -277,25 +306,38 @@ def run_cf_opd(cfg: FALCONConfig, device: str):
         if hasattr(rc, k):
             setattr(rc, k, v)
 
-    # 词表 (必须有)
-    if rc.mac_vocab_path and os.path.isfile(rc.mac_vocab_path):
-        from ranker.mac_data import FeatureVocab
+    # 词表 (必须有): 优先从 MAC/vocab/ 目录加载, 否则读独立 json
+    from ranker.mac_data import (
+        FeatureVocab, SPARSE_FIELDS, SEQ_ID_FIELDS, SEQ_FLOAT_FIELDS,
+    )
+
+    vocab = None
+    vocab_dir = (os.path.join(rc.mac_data_path, rc.mac_vocab_subdir)
+                 if rc.mac_data_path else "")
+    if vocab_dir and os.path.isdir(vocab_dir):
+        vocab = FeatureVocab.load_from_dir(vocab_dir)
+    elif rc.mac_vocab_path and os.path.isfile(rc.mac_vocab_path):
         vocab = FeatureVocab.load(rc.mac_vocab_path)
-        from ranker.mac_data import SPARSE_FIELDS, SEQ_ID_FIELDS, SEQ_FLOAT_FIELDS
-        feature_info = {
-            "vocab_sizes": vocab.vocab_sizes,
-            "sparse_fields": SPARSE_FIELDS,
-            "seq_id_fields": SEQ_ID_FIELDS,
-            "seq_float_fields": SEQ_FLOAT_FIELDS,
-            "mm_feat_dim": ranker_cfg_dict.get("mm_feat_dim", 2),
-            "label_field": rc.mac_label,
-        }
     else:
         raise FileNotFoundError(
-            "CF-OPD 需要 vocab 文件来重建 Ranker, 请指定 --mac_vocab_path 或在配置中设置"
+            "CF-OPD 需要词表来重建 Ranker。请确保以下之一:\n"
+            f"  1. --mac_data_path 指向含 {rc.mac_vocab_subdir}/ 子目录的 MAC 根目录 "
+            f"(当前尝试: {vocab_dir or 'N/A'})\n"
+            f"  2. --mac_vocab_path 指向词表 json 文件 (当前: {rc.mac_vocab_path or 'N/A'})"
         )
 
-    ranker_type = ranker_cfg_dict.get("ranker_type", "deepfm")
+    feature_info = {
+        "vocab_sizes": vocab.vocab_sizes,
+        "sparse_fields": SPARSE_FIELDS,
+        "seq_id_fields": SEQ_ID_FIELDS,
+        "seq_float_fields": SEQ_FLOAT_FIELDS,
+        "mm_feat_dim": ckpt.get("mm_feat_dim") or ranker_cfg_dict.get("mm_feat_dim", 2),
+        "label_field": rc.mac_label,
+    }
+
+    ranker_type = (ckpt.get("ranker_type")
+                   or ranker_cfg_dict.get("ranker_type")
+                   or "deepfm")
     ranker = create_mac_ranker(ranker_type, feature_info, rc).to(device)
     ranker.load_state_dict(ckpt["ranker_state_dict"])
     ranker.eval()

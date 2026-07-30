@@ -86,10 +86,50 @@ class JointPostTrainer:
         if fm_checkpoint and os.path.isfile(fm_checkpoint):
             ckpt = torch.load(fm_checkpoint, map_location=self.device)
             state = ckpt.get("model_state_dict", ckpt)
+
+            # ── 维度校验: 避免 strict=False 静默丢弃形状不匹配的权重 ──
+            own_state = self.fm_model.state_dict()
+            shape_mismatch = []
+            for k, v in state.items():
+                if k in own_state and own_state[k].shape != v.shape:
+                    shape_mismatch.append((k, tuple(v.shape), tuple(own_state[k].shape)))
+
+            if shape_mismatch:
+                msg_lines = ["FM checkpoint 权重形状不匹配 (共 %d 项):" % len(shape_mismatch)]
+                for k, ck_shape, my_shape in shape_mismatch[:10]:
+                    msg_lines.append(f"  {k}: checkpoint={ck_shape} vs model={my_shape}")
+                if len(shape_mismatch) > 10:
+                    msg_lines.append(f"  ... 还有 {len(shape_mismatch)-10} 项")
+                msg_lines.append("")
+                msg_lines.append("常见原因: fm 配置 (time_dim / data_dim / cond_dim / dit_dim / "
+                                 "dit_depth / dit_num_patches) 与训练该 checkpoint 时不一致。")
+                msg_lines.append(f"当前配置: time_dim={getattr(self.fcfg, 'time_dim', '?')}, "
+                                 f"data_dim={getattr(self.fcfg, 'data_dim', '?')}, "
+                                 f"cond_dim={getattr(self.fcfg, 'cond_dim', '?')}, "
+                                 f"backbone={getattr(self.fcfg, 'backbone_type', '?')}")
+                # 若 checkpoint 里存了配置, 打印出来便于对比
+                ck_cfg = ckpt.get("fm_config") or ckpt.get("config")
+                if isinstance(ck_cfg, dict):
+                    msg_lines.append(
+                        "checkpoint 配置: " + ", ".join(
+                            f"{k}={ck_cfg.get(k)}" for k in
+                            ("time_dim", "data_dim", "cond_dim", "backbone_type",
+                             "dit_dim", "dit_depth", "dit_num_patches")
+                            if k in ck_cfg
+                        )
+                    )
+                raise ValueError("\n".join(msg_lines))
+
             missing, unexpected = self.fm_model.load_state_dict(state, strict=False)
             logger.info(f"FM checkpoint 加载: {fm_checkpoint}")
+            n_loaded = len([k for k in state if k in own_state])
+            logger.info(f"  成功加载 {n_loaded}/{len(own_state)} 个参数张量")
             if missing:
-                logger.info(f"  新增参数 (未加载): {missing[:5]}...")
+                logger.info(f"  模型新增参数 (checkpoint 中不存在, 随机初始化): "
+                            f"{len(missing)} 项, 前 5: {missing[:5]}")
+            if unexpected:
+                logger.warning(f"  checkpoint 冗余参数 (模型中不存在, 已忽略): "
+                               f"{len(unexpected)} 项, 前 5: {unexpected[:5]}")
         else:
             logger.info("FM 随机初始化 (未指定 checkpoint)")
 
@@ -113,11 +153,20 @@ class JointPostTrainer:
         from ranker.models import create_mac_ranker
         self.ranker = create_mac_ranker(ranker_type, feature_info, self.rcfg).to(self.device)
 
+        # 保存构建信息, checkpoint 里一并写入, 便于 CF-OPD 阶段重建
+        self._ranker_type = ranker_type
+        self._feature_info = {
+            k: v for k, v in feature_info.items()
+            if k != "vocab_sizes"   # vocab_sizes 可能很大, 从 vocab 目录重新读
+        }
+        self._mm_feat_dim = feature_info.get("mm_feat_dim", 2)
+
         total = count_parameters(self.ranker)
         logger.info(f"MACRanker ({ranker_type}) 参数: {total:,} ({total/1e6:.1f}M)")
         logger.info(f"  embed_dim={self.rcfg.embed_dim}, "
                     f"hidden={self.rcfg.hidden_dims}, "
-                    f"mm_proj_dim={self.rcfg.mm_feat_proj_dim}")
+                    f"mm_proj_dim={self.rcfg.mm_feat_proj_dim}, "
+                    f"mm_feat_dim={self._mm_feat_dim}")
 
     # ── 训练主流程 ──
 
@@ -374,13 +423,18 @@ class JointPostTrainer:
 
     def _save_joint(self, output_dir, filename, optimizer, epoch, val_stats):
         path = os.path.join(output_dir, filename)
+        cond_proj = getattr(self, "_cond_proj", None)
         torch.save({
             "epoch": epoch,
             "fm_state_dict": self.fm_model.state_dict(),
             "ranker_state_dict": self.ranker.state_dict(),
-            "cond_proj_state_dict": getattr(self, "_cond_proj", None) and self._cond_proj.state_dict(),
+            "cond_proj_state_dict": cond_proj.state_dict() if cond_proj is not None else None,
             "optimizer_state_dict": optimizer.state_dict(),
             "val_stats": val_stats,
+            # 重建 Ranker 所需的元信息 (CF-OPD 阶段使用)
+            "ranker_type": getattr(self, "_ranker_type", None),
+            "mm_feat_dim": getattr(self, "_mm_feat_dim", None),
+            "feature_info": getattr(self, "_feature_info", None),
             "ranker_config": vars(self.rcfg),
             "fm_config": vars(self.fcfg),
         }, path)

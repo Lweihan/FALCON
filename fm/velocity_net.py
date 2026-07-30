@@ -61,7 +61,7 @@ class VelocityNetwork(nn.Module):
     def __init__(
         self,
         data_dim: int = 256,
-        time_dim: int = 128,
+        time_dim: int = 256,
         cond_dim: int = 256,
         hidden_dim: int = 512,
         num_layers: int = 6,
@@ -130,7 +130,7 @@ class TransformerVelocityNetwork(nn.Module):
     def __init__(
         self,
         data_dim: int = 256,
-        time_dim: int = 128,
+        time_dim: int = 256,
         cond_dim: int = 256,
         transformer_dim: int = 1024,
         depth: int = 8,

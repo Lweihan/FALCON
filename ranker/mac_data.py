@@ -11,11 +11,18 @@ MAC (Multi-domain Ad Click) 数据集字段:
 规模: 7500 万训练 / 400 万测试
 → 必须使用 streaming 模式, 不能一次性 load 进内存
 
-支持四种加载模式:
+支持五种加载模式:
+  local_dir       从本地 MAC 目录加载 (推荐, 默认)
+                  要求目录结构:
+                    MAC/
+                    ├── train/   *.parquet   训练数据
+                    ├── val/     *.parquet   验证数据
+                    └── vocab/   {field}.json 每字段一个词表文件
+                  parquet 逐行组流式读取, 不会一次性加载到内存
   hf_streaming    直接从 HuggingFace Hub 流式读取 (无需下载)
-  hf_download     先下载到本地缓存, 再读取
-  local_parquet   从本地 parquet 文件读取
-  local_csv       从本地 csv 文件读取
+  hf_download     先下载到本地缓存 (~80GB), 再读取
+  local_parquet   单个 parquet 文件 (全量读入内存)
+  local_csv       单个 csv 文件 (全量读入内存)
 """
 
 import json
@@ -136,6 +143,109 @@ class FeatureVocab:
         logger.info(f"词表已加载: {path} ({sum(obj.vocab_sizes.values()):,} 总词数)")
         return obj
 
+    @classmethod
+    def load_from_dir(cls, vocab_dir: str, fields: Optional[List[str]] = None) -> "FeatureVocab":
+        """
+        从词表目录加载 (每个字段一个 json 文件)。
+
+        MAC 数据集的 vocab/ 目录结构:
+            vocab/
+              user_id.json
+              user_feat0.json
+              ...
+              ad_feat2_seq.json
+
+        兼容两种 json 内容格式:
+          A) dict:  {"value1": 0, "value2": 1, ...}     直接是 value → idx 映射
+          B) list:  ["value1", "value2", ...]           按下标建立映射
+
+        统一在开头保留 PAD=0 / UNK=1;
+        若原 vocab 已含 PAD/UNK 则复用, 否则整体索引偏移 +2。
+        """
+        if not os.path.isdir(vocab_dir):
+            raise FileNotFoundError(f"词表目录不存在: {vocab_dir}")
+
+        fields = fields or (SPARSE_FIELDS + SEQ_ID_FIELDS)
+        obj = cls(fields)
+        found, missing = [], []
+
+        for field in fields:
+            fpath = os.path.join(vocab_dir, f"{field}.json")
+            if not os.path.isfile(fpath):
+                missing.append(field)
+                continue
+
+            try:
+                with open(fpath) as f:
+                    raw = json.load(f)
+            except Exception as e:
+                logger.warning(f"词表文件解析失败 {fpath}: {e}")
+                missing.append(field)
+                continue
+
+            mapping: Dict[str, int] = {}
+
+            if isinstance(raw, dict):
+                # 格式 A: {value: idx}
+                # 可能嵌套一层, 如 {"vocab": {...}} / {"stoi": {...}}
+                for wrapper in ("vocab", "stoi", "word2idx", "mapping"):
+                    if wrapper in raw and isinstance(raw[wrapper], dict):
+                        raw = raw[wrapper]
+                        break
+                for k, v in raw.items():
+                    try:
+                        mapping[str(k)] = int(v)
+                    except (TypeError, ValueError):
+                        continue
+            elif isinstance(raw, list):
+                # 格式 B: [value, ...] 按下标
+                for i, v in enumerate(raw):
+                    mapping[str(v)] = i
+            else:
+                logger.warning(f"词表文件格式无法识别 (非 dict/list): {fpath}")
+                missing.append(field)
+                continue
+
+            if not mapping:
+                missing.append(field)
+                continue
+
+            # 归一化: 确保 PAD=0 / UNK=1
+            has_pad = cls.PAD in mapping and mapping[cls.PAD] == 0
+            has_unk = cls.UNK in mapping and mapping[cls.UNK] == 1
+
+            if has_pad and has_unk:
+                obj._vocab[field] = mapping
+            else:
+                # 移除可能存在但位置不对的 PAD/UNK, 然后整体偏移
+                mapping.pop(cls.PAD, None)
+                mapping.pop(cls.UNK, None)
+                offset = 2
+                new_map = {cls.PAD: 0, cls.UNK: 1}
+                # 按原 idx 排序保持相对顺序稳定
+                for k, v in sorted(mapping.items(), key=lambda kv: kv[1]):
+                    new_map[k] = v + offset if v + offset not in (0, 1) else len(new_map)
+                # 保险: 如果原 idx 有重复/空洞, 重新紧凑编号
+                if len(set(new_map.values())) != len(new_map):
+                    new_map = {cls.PAD: 0, cls.UNK: 1}
+                    for i, k in enumerate(sorted(mapping.keys())):
+                        new_map[k] = i + 2
+                obj._vocab[field] = new_map
+
+            found.append(field)
+
+        obj._built = True
+
+        logger.info(f"词表已从目录加载: {vocab_dir}")
+        logger.info(f"  成功 {len(found)}/{len(fields)} 个字段, "
+                    f"总词数 {sum(obj.vocab_sizes.values()):,}")
+        for f in found:
+            logger.info(f"    {f}: {obj.vocab_sizes[f]:,}")
+        if missing:
+            logger.warning(f"  缺失字段 (仅含 PAD/UNK, vocab_size=2): {missing}")
+
+        return obj
+
 
 # ────────────────────────────────────────────────────────────
 # 数据集 (IterableDataset, 支持 streaming)
@@ -162,23 +272,41 @@ class MACIterableDataset(IterableDataset):
         label_field: str = "last",
         seq_pool_mode: str = "mean",
         max_samples: int = -1,
+        mm_feat_dim: int = -1,
     ):
         self.iter = hf_dataset_iter
         self.vocab = vocab
         self.label_field = label_field
         self.seq_pool_mode = seq_pool_mode
         self.max_samples = max_samples
+        self.mm_feat_dim = mm_feat_dim   # -1 = 不做对齐
 
     def _pool_float_seq(self, seq) -> np.ndarray:
-        """对实值序列做 pool, 返回 numpy array"""
-        if not seq:
+        """
+        对实值序列做 pool, 返回 1D numpy array。
+
+        支持:
+          1D 列表 [f1, f2, ...]        → 标量 (shape (1,))
+          2D 列表 [[..], [..], ...]    → 沿 axis=0 pool (shape (inner_dim,))
+        """
+        if seq is None or len(seq) == 0:
             return np.zeros(1, dtype=np.float32)
-        arr = np.array(seq, dtype=np.float32)
-        if self.seq_pool_mode == "mean":
-            return arr.mean(axis=0) if arr.ndim > 1 else np.array([arr.mean()])
+
+        arr = np.asarray(seq, dtype=np.float32)
+
+        if arr.ndim == 1:
+            if self.seq_pool_mode == "max":
+                return np.array([arr.max()], dtype=np.float32)
+            if self.seq_pool_mode == "sum":
+                return np.array([arr.sum()], dtype=np.float32)
+            return np.array([arr.mean()], dtype=np.float32)
+
+        # arr.ndim >= 2: 沿第 0 维 pool
         if self.seq_pool_mode == "max":
-            return arr.max(axis=0) if arr.ndim > 1 else np.array([arr.max()])
-        return arr.sum(axis=0) if arr.ndim > 1 else np.array([arr.sum()])
+            return arr.max(axis=0).astype(np.float32).reshape(-1)
+        if self.seq_pool_mode == "sum":
+            return arr.sum(axis=0).astype(np.float32).reshape(-1)
+        return arr.mean(axis=0).astype(np.float32).reshape(-1)
 
     def __iter__(self):
         n = 0
@@ -193,17 +321,23 @@ class MACIterableDataset(IterableDataset):
                 f: [str(v) for v in (row.get(f) or [])] for f in SEQ_ID_FIELDS
             }
 
-            # mm_feat 实值序列 → mean pool → concat
+            # mm_feat 实值序列 → pool → concat
             mm_parts = []
             for f in SEQ_FLOAT_FIELDS:
-                seq = row.get(f) or []
-                pooled = self._pool_float_seq(seq)
-                mm_parts.append(pooled)
+                mm_parts.append(self._pool_float_seq(row.get(f)))
 
             if mm_parts:
                 mm_feats = np.concatenate(mm_parts).astype(np.float32)
             else:
                 mm_feats = np.zeros(1, dtype=np.float32)
+
+            # 维度对齐: 不同样本 mm_feat 长度可能不一致 (缺失/变长),
+            # 统一 pad/truncate 到 mm_feat_dim, 否则 collate 时 np.stack 会报错
+            if self.mm_feat_dim > 0 and mm_feats.shape[0] != self.mm_feat_dim:
+                fixed = np.zeros(self.mm_feat_dim, dtype=np.float32)
+                n = min(mm_feats.shape[0], self.mm_feat_dim)
+                fixed[:n] = mm_feats[:n]
+                mm_feats = fixed
 
             label = float(row.get(self.label_field, 0.0))
 
@@ -279,7 +413,7 @@ def _load_hf_iter(split: str, max_samples: int = -1, streaming: bool = True):
 
 
 def _load_local_iter(path: str, fmt: str = "parquet"):
-    """从本地文件加载迭代器。"""
+    """从本地单文件加载 (全量读入内存, 仅适合小文件)。"""
     if fmt == "parquet":
         import pyarrow.parquet as pq
         table = pq.read_table(path)
@@ -291,25 +425,93 @@ def _load_local_iter(path: str, fmt: str = "parquet"):
         raise ValueError(f"不支持的格式: {fmt}")
 
 
+class ParquetDirIterable:
+    """
+    可重复迭代的 parquet 目录流式读取器。
+
+    逐文件、逐行组 (row group batch) 读取, 避免一次性加载数十 GB 到内存。
+    实现 __iter__ 使其可被多个 epoch 重复遍历 (普通 generator 只能迭代一次)。
+
+    用法:
+        it = ParquetDirIterable("/data/MAC/train", batch_size=10000)
+        for row in it:   # row 是 dict
+            ...
+    """
+
+    def __init__(self, dir_path: str, batch_size: int = 10000, columns: Optional[List[str]] = None):
+        import glob as _glob
+
+        self.dir_path = dir_path
+        self.batch_size = batch_size
+        self.columns = columns
+
+        if not os.path.isdir(dir_path):
+            raise FileNotFoundError(f"数据目录不存在: {dir_path}")
+
+        self.files = sorted(_glob.glob(os.path.join(dir_path, "*.parquet")))
+        if not self.files:
+            # 兼容 snappy 后缀等变体
+            self.files = sorted(
+                p for p in _glob.glob(os.path.join(dir_path, "*"))
+                if p.endswith((".parquet", ".pq"))
+            )
+        if not self.files:
+            raise FileNotFoundError(f"目录下未找到 parquet 文件: {dir_path}")
+
+        logger.info(f"parquet 目录: {dir_path} ({len(self.files)} 个文件)")
+
+    def num_rows(self) -> int:
+        """统计总行数 (只读 metadata, 很快)。"""
+        import pyarrow.parquet as pq
+        total = 0
+        for f in self.files:
+            try:
+                total += pq.ParquetFile(f).metadata.num_rows
+            except Exception:
+                pass
+        return total
+
+    def __iter__(self) -> Iterator[dict]:
+        import pyarrow.parquet as pq
+
+        for fpath in self.files:
+            try:
+                pf = pq.ParquetFile(fpath)
+            except Exception as e:
+                logger.warning(f"跳过无法打开的 parquet 文件 {fpath}: {e}")
+                continue
+
+            for batch in pf.iter_batches(batch_size=self.batch_size, columns=self.columns):
+                # RecordBatch → list of dict
+                for row in batch.to_pylist():
+                    yield row
+
+
 def build_vocab_from_mac(
-    load_mode: str = "hf_streaming",
+    load_mode: str = "local_dir",
     data_path: str = "",
     max_rows: int = 5_000_000,
     save_path: str = "",
+    parquet_batch_size: int = 10000,
+    train_subdir: str = "train",
 ) -> FeatureVocab:
     """
-    扫描 MAC 数据集构建词表。
+    扫描 MAC 数据集构建词表 (fallback 路径)。
+
+    local_dir 模式下应优先使用 FeatureVocab.load_from_dir() 读取预置词表,
+    只有在 vocab/ 目录缺失时才走这里。
 
     Args:
-        max_rows: 最多扫描的行数 (streaming 下不用全量扫描也能覆盖大部分词)
+        max_rows: 最多扫描的行数
         save_path: 词表保存路径, 空则不保存
-
-    Returns:
-        vocab: 词表对象
     """
     vocab = FeatureVocab(SPARSE_FIELDS + SEQ_ID_FIELDS)
 
-    if load_mode in ("hf_streaming", "hf_download"):
+    if load_mode == "local_dir":
+        ds = ParquetDirIterable(
+            os.path.join(data_path, train_subdir), batch_size=parquet_batch_size
+        )
+    elif load_mode in ("hf_streaming", "hf_download"):
         streaming = (load_mode == "hf_streaming")
         ds = _load_hf_iter("train", streaming=streaming)
     elif load_mode == "local_parquet":
@@ -317,6 +519,7 @@ def build_vocab_from_mac(
     else:
         ds = _load_local_iter(data_path, "csv")
 
+    logger.info(f"开始扫描数据构建词表 (最多 {max_rows:,} 行)...")
     vocab.build_from_iterator(ds, max_rows=max_rows)
 
     if save_path:
@@ -333,70 +536,134 @@ def create_mac_dataloaders(
     """
     创建 MAC 训练/验证 DataLoader。
 
+    local_dir 模式 (推荐, 默认):
+        {mac_data_path}/
+          {mac_train_subdir}/   *.parquet   → train_loader
+          {mac_val_subdir}/     *.parquet   → val_loader
+          {mac_vocab_subdir}/   {field}.json → vocab
+
     Args:
         ranker_config: RankerConfig
-        vocab: 已有词表 (None 则自动构建)
-        build_vocab_samples: 词表构建扫描行数
+        vocab: 已有词表 (None 则自动加载/构建)
+        build_vocab_samples: 词表 fallback 构建时扫描的行数
 
     Returns:
         (train_loader, val_loader, vocab, feature_info)
-        feature_info: {"vocab_sizes": {...}, "mm_feat_dim": int, "seq_fields": [...], ...}
     """
     cfg = ranker_config
     load_mode = cfg.mac_load_mode
     label = cfg.mac_label
 
-    # ── 词表 ──
-    if vocab is None:
-        if cfg.mac_vocab_path and os.path.isfile(cfg.mac_vocab_path):
-            vocab = FeatureVocab.load(cfg.mac_vocab_path)
-        else:
-            logger.info("未找到词表, 开始构建...")
-            vocab = build_vocab_from_mac(
-                load_mode=load_mode,
-                data_path=cfg.mac_data_path,
-                max_rows=build_vocab_samples if cfg.mac_max_samples < 0 else cfg.mac_max_samples,
-                save_path=cfg.mac_vocab_path,
-            )
+    # ════════════════════════════════════════════════
+    # local_dir 模式 (推荐)
+    # ════════════════════════════════════════════════
+    if load_mode == "local_dir":
+        root = cfg.mac_data_path
+        if not root:
+            raise ValueError("local_dir 模式需要设置 mac_data_path (MAC 根目录)")
+        if not os.path.isdir(root):
+            raise FileNotFoundError(f"MAC 根目录不存在: {root}")
 
-    # ── 探测 mm_feat 维度 ──
-    mm_feat_dim = _detect_mm_feat_dim(load_mode, cfg.mac_data_path)
+        train_dir = os.path.join(root, cfg.mac_train_subdir)
+        val_dir = os.path.join(root, cfg.mac_val_subdir)
+        vocab_dir = os.path.join(root, cfg.mac_vocab_subdir)
+
+        logger.info(f"MAC local_dir 模式: {root}")
+        logger.info(f"  train: {train_dir}")
+        logger.info(f"  val:   {val_dir}")
+        logger.info(f"  vocab: {vocab_dir}")
+
+        # ── 词表: 优先读 vocab/ 目录 ──
+        if vocab is None:
+            if os.path.isdir(vocab_dir):
+                vocab = FeatureVocab.load_from_dir(vocab_dir)
+            elif cfg.mac_vocab_path and os.path.isfile(cfg.mac_vocab_path):
+                vocab = FeatureVocab.load(cfg.mac_vocab_path)
+            else:
+                logger.warning(
+                    f"未找到词表目录 {vocab_dir}, fallback 到扫描 train 数据构建 "
+                    "(耗时较长)"
+                )
+                vocab = build_vocab_from_mac(
+                    load_mode="local_dir",
+                    data_path=root,
+                    max_rows=build_vocab_samples,
+                    save_path=cfg.mac_vocab_path,
+                    parquet_batch_size=cfg.mac_parquet_batch_size,
+                    train_subdir=cfg.mac_train_subdir,
+                )
+
+        # ── 数据迭代器 ──
+        train_src = ParquetDirIterable(train_dir, batch_size=cfg.mac_parquet_batch_size)
+        val_src = ParquetDirIterable(val_dir, batch_size=cfg.mac_parquet_batch_size)
+
+        # 打印规模 (只读 metadata)
+        try:
+            logger.info(f"  train 总行数: {train_src.num_rows():,}")
+            logger.info(f"  val   总行数: {val_src.num_rows():,}")
+        except Exception:
+            pass
+
+        # ── mm_feat 维度探测 (从第一行) ──
+        mm_feat_dim = _detect_mm_feat_dim_from_row(_peek_first_row(train_src))
+
+        train_max = cfg.mac_max_samples if cfg.mac_max_samples > 0 else -1
+        val_max = cfg.mac_val_max_samples if cfg.mac_val_max_samples > 0 else -1
+
+    # ════════════════════════════════════════════════
+    # 其他模式 (hf_streaming / hf_download / local_parquet / local_csv)
+    # ════════════════════════════════════════════════
+    else:
+        # ── 词表 ──
+        if vocab is None:
+            if cfg.mac_vocab_path and os.path.isfile(cfg.mac_vocab_path):
+                vocab = FeatureVocab.load(cfg.mac_vocab_path)
+            else:
+                logger.info("未找到词表, 开始构建...")
+                vocab = build_vocab_from_mac(
+                    load_mode=load_mode,
+                    data_path=cfg.mac_data_path,
+                    max_rows=(build_vocab_samples if cfg.mac_max_samples < 0
+                              else cfg.mac_max_samples),
+                    save_path=cfg.mac_vocab_path,
+                )
+
+        if load_mode in ("hf_streaming", "hf_download"):
+            streaming = (load_mode == "hf_streaming")
+            train_src = _load_hf_iter("train", streaming=streaming)
+            val_src = _load_hf_iter("test", streaming=streaming)
+            n_val = (int(4_064_648 * cfg.mac_val_ratio)
+                     if cfg.mac_val_ratio < 1.0 else -1)
+        else:
+            fmt = "parquet" if load_mode == "local_parquet" else "csv"
+            all_rows = _load_local_iter(cfg.mac_data_path, fmt)
+            n_total = len(all_rows)
+            n_train = int(n_total * (1 - cfg.mac_val_ratio))
+            train_src = all_rows[:n_train]
+            val_src = all_rows[n_train:]
+            n_val = len(val_src)
+
+        mm_feat_dim = _detect_mm_feat_dim(load_mode, cfg.mac_data_path)
+
+        train_max = cfg.mac_max_samples if cfg.mac_max_samples > 0 else -1
+        val_max = min(n_val, cfg.mac_val_max_samples) if n_val > 0 else cfg.mac_val_max_samples
+
     logger.info(f"mm_feat 合并维度: {mm_feat_dim}")
 
-    # ── val 数据 ──
-    # HF 数据集有独立 test split; streaming 模式用 train 的前 val_ratio
-    if load_mode in ("hf_streaming", "hf_download"):
-        streaming = (load_mode == "hf_streaming")
-        train_ds_iter = _load_hf_iter("train", streaming=streaming)
-        # val 直接用 HF test split
-        val_ds_iter = _load_hf_iter("test", streaming=streaming)
-
-        # 用 mac_val_ratio 限制 val 大小 (400万 * 0.01 ≈ 4万)
-        n_val = int(4_064_648 * cfg.mac_val_ratio) if cfg.mac_val_ratio < 1.0 else -1
-    else:
-        import pandas as pd
-        fmt = "parquet" if load_mode == "local_parquet" else "csv"
-        all_rows = _load_local_iter(cfg.mac_data_path, fmt)
-        n_total = len(all_rows)
-        n_train = int(n_total * (1 - cfg.mac_val_ratio))
-        train_ds_iter = all_rows[:n_train]
-        val_ds_iter = all_rows[n_train:]
-        n_val = len(val_ds_iter)
-
-    train_max = cfg.mac_max_samples if cfg.mac_max_samples > 0 else -1
-    val_max = min(n_val, 100_000) if n_val > 0 else 100_000  # val 最多 10 万
-
+    # ── 构建 Dataset ──
     train_dataset = MACIterableDataset(
-        train_ds_iter, vocab, label_field=label,
+        train_src, vocab, label_field=label,
         seq_pool_mode=cfg.seq_pool_mode, max_samples=train_max,
+        mm_feat_dim=mm_feat_dim,
     )
     val_dataset = MACIterableDataset(
-        val_ds_iter, vocab, label_field=label,
+        val_src, vocab, label_field=label,
         seq_pool_mode=cfg.seq_pool_mode, max_samples=val_max,
+        mm_feat_dim=mm_feat_dim,
     )
 
-    # streaming + IterableDataset 不能用多进程 worker
-    nw = 0 if load_mode in ("hf_streaming", "hf_download") else min(cfg.mac_num_workers, 4)
+    # IterableDataset 用多 worker 会导致数据重复, 固定为 0
+    nw = 0
 
     train_loader = DataLoader(
         train_dataset, batch_size=cfg.batch_size,
@@ -419,6 +686,42 @@ def create_mac_dataloaders(
     }
 
     return train_loader, val_loader, vocab, feature_info
+
+
+def _peek_first_row(iterable) -> dict:
+    """取迭代器/序列的第一行 (不消耗可重复迭代的 ParquetDirIterable)。"""
+    try:
+        if isinstance(iterable, (list, tuple)):
+            return iterable[0] if iterable else {}
+        return next(iter(iterable))
+    except (StopIteration, IndexError, Exception):
+        return {}
+
+
+def _detect_mm_feat_dim_from_row(row: dict) -> int:
+    """
+    从单行样本探测 mm_feat 合并后的维度。
+
+    mm_feat*_seq 是 List[float]; mean pool 后:
+      - 若是 1D 实值列表 → 标量 (1 维)
+      - 若是嵌套 2D → 内层维度
+    """
+    if not row:
+        logger.warning("无法探测 mm_feat 维度 (空样本), 使用默认值 2")
+        return len(SEQ_FLOAT_FIELDS)
+
+    total = 0
+    for f in SEQ_FLOAT_FIELDS:
+        seq = row.get(f)
+        if not seq:
+            total += 1   # 缺失也占 1 维 (输出 0)
+            continue
+        first = seq[0]
+        if isinstance(first, (list, tuple)):
+            total += len(first)   # 2D: mean pool 沿 axis=0 → 内层维度
+        else:
+            total += 1            # 1D: mean → 标量
+    return max(total, len(SEQ_FLOAT_FIELDS))
 
 
 def _detect_mm_feat_dim(load_mode: str, data_path: str = "", n_probe: int = 100) -> int:

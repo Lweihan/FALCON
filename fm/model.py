@@ -30,7 +30,7 @@ class FlowMatchingModel(torch.nn.Module):
     def __init__(
         self,
         data_dim: int = 256,
-        time_dim: int = 128,
+        time_dim: int = 256,
         cond_dim: int = 256,
         backbone_type: str = "dit",
         # ── DiT 参数 ──
@@ -70,7 +70,7 @@ class FlowMatchingModel(torch.nn.Module):
                 dropout=dit_dropout,
                 qk_norm=dit_qk_norm,
                 use_rope=dit_use_rope,
-                time_dim=max(time_dim, 256),
+                time_dim=time_dim,
                 use_gradient_checkpointing=use_gradient_checkpointing,
             )
         elif backbone_type == "transformer":

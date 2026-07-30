@@ -34,7 +34,9 @@ class LatentConfig:
 class FMConfig:
     """Flow Matching (Teacher) 配置"""
     data_dim: int = 256           # 数据维度 (= LatentConfig.fusion_output_dim)
-    time_dim: int = 128          # 时间编码维度
+    # 时间编码维度: 必须与 checkpoint 保存时一致, 否则 time_embed.1 权重形状不匹配
+    # 所有 backbone (dit/transformer/mlp) 统一使用 256
+    time_dim: int = 256
     cond_dim: int = 256          # 条件维度 (= data_dim)
     # Backbone 选择: dit (推荐) / transformer / mlp
     backbone_type: str = "dit"
@@ -282,14 +284,24 @@ class RankerConfig:
     train_ratio: float = 0.8
     num_workers: int = 4
     # MAC 数据集专属
-    # load_mode: hf_streaming (不下载,流式读) / hf_download (下载后缓存) / local_parquet / local_csv
-    mac_load_mode: str = "hf_streaming"
-    mac_data_path: str = ""          # hf_streaming 时忽略; local_* 时必填
+    # load_mode:
+    #   local_dir     从本地 MAC 目录加载 (推荐; 需 train/ val/ vocab/ 子目录)
+    #   hf_streaming  直接从 HuggingFace 流式读 (无需下载)
+    #   hf_download   先下载到本地缓存 (~80GB)
+    #   local_parquet 单个 parquet 文件
+    #   local_csv     单个 csv 文件
+    mac_load_mode: str = "local_dir"
+    mac_data_path: str = ""          # local_dir: MAC 根目录; local_*: 单文件路径
+    mac_train_subdir: str = "train"  # 训练数据子目录 (local_dir 模式)
+    mac_val_subdir: str = "val"      # 验证数据子目录 (local_dir 模式)
+    mac_vocab_subdir: str = "vocab"  # 词表子目录, 每字段一个 json (local_dir 模式)
+    mac_parquet_batch_size: int = 10000   # parquet 流式读取的行组大小
     mac_label: str = "last"          # CVR 标签: linear / mta / first / last
-    mac_vocab_path: str = ""         # 词表保存路径, 空则不保存
+    mac_vocab_path: str = ""         # 独立词表 json 路径 (非 local_dir 模式)
     mac_max_samples: int = -1        # -1 全量; 正数限制 (调试)
-    mac_val_ratio: float = 0.01      # streaming 模式: 前 N% 作 val (约 75万条)
-    mac_num_workers: int = 0         # streaming 时必须 0
+    mac_val_max_samples: int = 100_000  # val 最多读取样本数
+    mac_val_ratio: float = 0.01      # 非 local_dir 模式: 前 N% 作 val
+    mac_num_workers: int = 0         # streaming / IterableDataset 时必须 0
     seq_pool_mode: str = "mean"      # 序列特征池化: mean / max / sum
     mm_feat_proj_dim: int = 64       # mm_feat 投影后维度 (-1 = 不投影直接拼接)
     # 联合后训练输出
