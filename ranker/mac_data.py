@@ -273,6 +273,8 @@ class MACIterableDataset(IterableDataset):
         seq_pool_mode: str = "mean",
         max_samples: int = -1,
         mm_feat_dim: int = -1,
+        label_mode: str = "binary",
+        label_threshold: float = 0.0,
     ):
         self.iter = hf_dataset_iter
         self.vocab = vocab
@@ -280,6 +282,25 @@ class MACIterableDataset(IterableDataset):
         self.seq_pool_mode = seq_pool_mode
         self.max_samples = max_samples
         self.mm_feat_dim = mm_feat_dim   # -1 = 不做对齐
+        self.label_mode = label_mode
+        self.label_threshold = label_threshold
+
+        if label_mode not in ("binary", "continuous"):
+            raise ValueError(
+                f"label_mode 必须是 binary / continuous, got {label_mode!r}"
+            )
+
+    def _transform_label(self, raw: float) -> float:
+        """
+        标签变换。
+
+        MAC 的 linear/mta/first/last 是多触点归因 (MTA) 权重, 为连续实数。
+          binary:     > threshold 视为正例 → 0.0 / 1.0
+          continuous: clip 到 [0,1] 保留强度 (BCE 软标签要求目标在 [0,1])
+        """
+        if self.label_mode == "binary":
+            return float(raw > self.label_threshold)
+        return float(min(max(raw, 0.0), 1.0))
 
     def _pool_float_seq(self, seq) -> np.ndarray:
         """
@@ -339,13 +360,15 @@ class MACIterableDataset(IterableDataset):
                 fixed[:n] = mm_feats[:n]
                 mm_feats = fixed
 
-            label = float(row.get(self.label_field, 0.0))
+            raw_label = float(row.get(self.label_field) or 0.0)
+            label = self._transform_label(raw_label)
 
             yield {
                 "sparse_ids": sparse_ids,
                 "seq_id_lists": seq_id_lists,
                 "mm_feats": mm_feats,
                 "label": label,
+                "raw_label": raw_label,   # 原始归因权重, 便于分析/调试
             }
 
             n += 1
@@ -380,6 +403,9 @@ def mac_collate_fn(batch: List[dict]) -> dict:
     )
 
     label = torch.tensor([s["label"] for s in batch], dtype=torch.float32)
+    raw_label = torch.tensor(
+        [s.get("raw_label", s["label"]) for s in batch], dtype=torch.float32
+    )
 
     # seq_id 特征: 把 list[str] 转为 list[int] 的 mean
     # 实际上在模型内部做 embedding lookup + pool; 这里传 list of lists
@@ -393,6 +419,7 @@ def mac_collate_fn(batch: List[dict]) -> dict:
         "seq_id_lists": seq_id_lists,
         "mm_feats": mm_feats,
         "label": label,
+        "raw_label": raw_label,
     }
 
 
@@ -681,16 +708,31 @@ def create_mac_dataloaders(
     logger.info(f"mm_feat 合并维度: {mm_feat_dim}")
 
     # ── 构建 Dataset ──
-    train_dataset = MACIterableDataset(
-        train_src, vocab, label_field=label,
-        seq_pool_mode=cfg.seq_pool_mode, max_samples=train_max,
+    ds_kwargs = dict(
+        label_field=label,
+        seq_pool_mode=cfg.seq_pool_mode,
         mm_feat_dim=mm_feat_dim,
+        label_mode=cfg.mac_label_mode,
+        label_threshold=cfg.mac_label_threshold,
+    )
+    train_dataset = MACIterableDataset(
+        train_src, vocab, max_samples=train_max, **ds_kwargs
     )
     val_dataset = MACIterableDataset(
-        val_src, vocab, label_field=label,
-        seq_pool_mode=cfg.seq_pool_mode, max_samples=val_max,
-        mm_feat_dim=mm_feat_dim,
+        val_src, vocab, max_samples=val_max, **ds_kwargs
     )
+
+    logger.info(f"标签口径: mode={cfg.mac_label_mode}, field={label}, "
+                f"threshold={cfg.mac_label_threshold}")
+
+    # 标签分布探测会消耗迭代器: 只对可重复迭代的源做
+    # (ParquetDirIterable 实现了 __iter__ 可重复; HF streaming 的 IterableDataset
+    #  一旦消耗就取不回来, 跳过以免训练少样本)
+    if isinstance(train_src, (ParquetDirIterable, list, tuple)):
+        _log_label_stats(train_src, label, cfg.mac_label_mode, cfg.mac_label_threshold)
+    else:
+        logger.info("(streaming 源跳过标签分布探测, 避免消耗数据流)")
+
 
     # IterableDataset 用多 worker 会导致数据重复, 固定为 0
     nw = 0
@@ -713,9 +755,91 @@ def create_mac_dataloaders(
         "seq_float_fields": SEQ_FLOAT_FIELDS,
         "mm_feat_dim": mm_feat_dim,
         "label_field": label,
+        "label_mode": cfg.mac_label_mode,
+        "label_threshold": cfg.mac_label_threshold,
     }
 
     return train_loader, val_loader, vocab, feature_info
+
+
+def _log_label_stats(
+    source,
+    label_field: str,
+    label_mode: str,
+    threshold: float,
+    n_probe: int = 20000,
+):
+    """
+    抽样探测标签分布并打印, 异常时明确 warning。
+
+    这类问题在大数据集上很容易踩到且不报错:
+      - 阈值设错 → 全负样本 → AUC 恒 0.5
+      - 标签字段选错 → 全 0 或方差为 0 → 模型学不到东西
+    """
+    try:
+        raws = []
+        for i, row in enumerate(source):
+            if i >= n_probe:
+                break
+            raws.append(float(row.get(label_field) or 0.0))
+    except Exception as e:
+        logger.warning(f"标签分布探测失败 ({e}), 跳过")
+        return
+
+    if not raws:
+        logger.warning("标签分布探测: 未读到任何样本")
+        return
+
+    arr = np.asarray(raws, dtype=np.float64)
+    n = arr.size
+    uniq = np.unique(arr)
+
+    logger.info(f"标签分布 (抽样 {n:,} 条, 字段 '{label_field}'):")
+    logger.info(f"  原始值: min={arr.min():.4f}, max={arr.max():.4f}, "
+                f"mean={arr.mean():.4f}, std={arr.std():.4f}, "
+                f"唯一值数={len(uniq)}")
+
+    if label_mode == "binary":
+        pos_rate = float((arr > threshold).mean())
+        logger.info(f"  二值化 (> {threshold}): 正样本率={pos_rate:.4%} "
+                    f"({int(pos_rate * n):,} / {n:,})")
+        if pos_rate == 0.0:
+            logger.warning(
+                f"  [!] 正样本率为 0! 所有标签都 <= {threshold}。"
+                f"AUC 将恒为 0.5, 模型无法学习。\n"
+                f"      建议: 检查 mac_label 字段 (当前 '{label_field}') 或调低 "
+                f"mac_label_threshold (当前 {threshold}, 数据 max={arr.max():.4f})"
+            )
+        elif pos_rate == 1.0:
+            logger.warning(
+                f"  [!] 正样本率为 100%! 所有标签都 > {threshold}。"
+                f"建议调高 mac_label_threshold (数据 min={arr.min():.4f})"
+            )
+        elif pos_rate < 0.0001:
+            logger.warning(
+                f"  [!] 正样本率极低 ({pos_rate:.6%}), 训练可能不稳定。"
+                "考虑正负样本加权或下采样负例。"
+            )
+    else:
+        clipped = np.clip(arr, 0.0, 1.0)
+        qs = np.percentile(clipped, [25, 50, 75, 90, 99])
+        logger.info(f"  clip 到 [0,1] 后: mean={clipped.mean():.4f}, "
+                    f"std={clipped.std():.4f}")
+        logger.info(f"  分位数 p25/p50/p75/p90/p99 = "
+                    + " / ".join(f"{q:.4f}" for q in qs))
+        n_clipped = int(((arr < 0) | (arr > 1)).sum())
+        if n_clipped:
+            logger.warning(f"  [!] {n_clipped:,}/{n:,} 条标签超出 [0,1] 已被截断")
+        if clipped.std() < 1e-8:
+            logger.warning(
+                "  [!] 标签方差接近 0, 回归指标 (Pearson/Spearman) 将无定义。"
+                f"检查 mac_label 字段 (当前 '{label_field}')"
+            )
+        if len(uniq) <= 2:
+            logger.warning(
+                f"  [!] 标签只有 {len(uniq)} 个唯一值 {uniq.tolist()}, "
+                "本质是二值数据。建议改用 mac_label_mode='binary'"
+            )
 
 
 def _peek_first_row(iterable) -> dict:

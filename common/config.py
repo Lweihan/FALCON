@@ -298,6 +298,16 @@ class RankerConfig:
     mac_vocab_subdir: str = "vocabs"  # 词表子目录, 每字段一个 json (local_dir 模式)
     mac_parquet_batch_size: int = 10000   # parquet 流式读取的行组大小
     mac_label: str = "last"          # CVR 标签: linear / mta / first / last
+    # ── 标签口径 ──
+    # MAC 的 linear/mta/first/last 是多触点归因 (MTA) 权重, 为连续实数
+    #   binary:     label = float(raw > mac_label_threshold), 标准 CVR 二分类
+    #               → 评估用 AUC / GAUC / LogLoss / PosRate
+    #   continuous: label = clip(raw, 0, 1), 保留归因权重强度
+    #               → 评估用 MSE / MAE / Pearson / Spearman (+ 二值化参考 AUC)
+    mac_label_mode: str = "binary"        # binary / continuous
+    mac_label_threshold: float = 0.0      # binary 模式: > threshold 视为正例
+    mac_continuous_loss: str = "bce"      # continuous 模式损失: bce (软标签) / mse
+    mac_best_metric: str = "auto"         # best ckpt 判据: auto / auc / mse / logloss
     mac_vocab_path: str = ""         # 独立词表 json 路径 (非 local_dir 模式)
     mac_max_samples: int = -1        # -1 全量; 正数限制 (调试)
     mac_val_max_samples: int = 100_000  # val 最多读取样本数

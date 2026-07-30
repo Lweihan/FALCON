@@ -28,7 +28,7 @@ from common.distributed import (
     reduce_value, setup_performance_flags, unwrap_model,
 )
 from common.logger import get_logger
-from common.utils import count_parameters, save_checkpoint
+from common.utils import count_parameters, save_checkpoint, make_grad_scaler, autocast
 from scenario.data_loader import create_dataloader
 from .model import FlowMatchingModel
 
@@ -172,7 +172,7 @@ class FMTrainer:
         scheduler = CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=cfg.lr * 0.01)
 
         use_amp = cfg.use_amp and "cuda" in str(self.device)
-        scaler = torch.cuda.amp.GradScaler() if use_amp else None
+        scaler = make_grad_scaler(use_amp)
 
         best_val = float("inf")
         ema_train = ema_val = None
@@ -317,7 +317,7 @@ class FMTrainer:
 
             with sync_ctx:
                 if use_amp:
-                    with torch.cuda.amp.autocast():
+                    with autocast():
                         loss_dict = self._compute_loss(x_clean, cond, delta_t)
                     scaler.scale(loss_dict["loss"] / accum).backward()
                 else:

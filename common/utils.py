@@ -24,6 +24,29 @@ def count_parameters(model: torch.nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+# ────────────────────────────────────────────────────────────
+# AMP 兼容层
+# torch >= 2.0 用 torch.amp.*; 旧版 fallback 到 torch.cuda.amp.*
+# ────────────────────────────────────────────────────────────
+
+def make_grad_scaler(enabled: bool, device_type: str = "cuda"):
+    """创建 GradScaler (兼容新旧 torch API)。enabled=False 返回 None。"""
+    if not enabled:
+        return None
+    try:
+        return torch.amp.GradScaler(device_type)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.GradScaler()
+
+
+def autocast(enabled: bool = True, device_type: str = "cuda"):
+    """autocast 上下文 (兼容新旧 torch API)。"""
+    try:
+        return torch.amp.autocast(device_type, enabled=enabled)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.autocast(enabled=enabled)
+
+
 def save_checkpoint(
     path: str,
     model: torch.nn.Module,

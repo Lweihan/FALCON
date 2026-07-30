@@ -114,8 +114,21 @@ def parse_args():
         "--mac_label",
         default="last",
         choices=["linear", "mta", "first", "last"],
-        help="CVR 标签字段",
+        help="CVR 标签字段 (多触点归因权重)",
     )
+    parser.add_argument(
+        "--mac_label_mode",
+        default=None,
+        choices=["binary", "continuous"],
+        help="标签口径: binary=二值化 CVR 分类 (AUC/GAUC); "
+             "continuous=保留归因权重 (MSE/Pearson)",
+    )
+    parser.add_argument("--mac_label_threshold", type=float, default=None,
+                        help="binary 模式: > threshold 视为正例 (默认 0.0)")
+    parser.add_argument("--mac_continuous_loss", default=None, choices=["bce", "mse"],
+                        help="continuous 模式损失: bce(软标签, 默认) / mse")
+    parser.add_argument("--mac_best_metric", default=None,
+                        help="best ckpt 判据: auto / auc / mse / logloss")
     parser.add_argument("--mac_vocab_path", default="",
                         help="独立词表 json 路径 (非 local_dir 模式)")
     parser.add_argument("--mac_max_samples", type=int, default=-1, help="-1=全量; 正数=限制(调试)")
@@ -174,6 +187,14 @@ def build_configs(args) -> FALCONConfig:
     if args.mac_parquet_batch_size is not None:
         rc.mac_parquet_batch_size = args.mac_parquet_batch_size
     rc.mac_label = args.mac_label
+    if args.mac_label_mode is not None:
+        rc.mac_label_mode = args.mac_label_mode
+    if args.mac_label_threshold is not None:
+        rc.mac_label_threshold = args.mac_label_threshold
+    if args.mac_continuous_loss is not None:
+        rc.mac_continuous_loss = args.mac_continuous_loss
+    if args.mac_best_metric is not None:
+        rc.mac_best_metric = args.mac_best_metric
     if args.mac_vocab_path:
         rc.mac_vocab_path = args.mac_vocab_path
     if args.mac_max_samples != -1:
@@ -231,7 +252,8 @@ def run_joint_train(cfg: FALCONConfig, ranker_type: str, device: str) -> str:
     print("Stage 1: Joint Post-train (FM + MACRanker on MAC dataset)")
     print("=" * 60)
     print(f"  MAC 加载模式: {rc.mac_load_mode}")
-    print(f"  CVR 标签:    {rc.mac_label}")
+    print(f"  CVR 标签:    {rc.mac_label} (mode={rc.mac_label_mode}, "
+          f"threshold={rc.mac_label_threshold})")
     print(f"  Ranker 类型: {ranker_type}")
     print(f"  联合 loss:   α={rc.joint_alpha} * L_CVR + {1-rc.joint_alpha:.2f} * L_flow")
     print(f"  输出目录:    {output_dir}")
