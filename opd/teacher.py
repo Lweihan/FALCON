@@ -45,7 +45,7 @@ class FMTeacher:
 
         # 加载 checkpoint
         if checkpoint_path:
-            ckpt = torch.load(checkpoint_path, map_location=device)
+            ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
             self.model.load_state_dict(ckpt['model_state_dict'])
             logger.info(f"FM Teacher 加载: {checkpoint_path}")
 

@@ -141,7 +141,7 @@ class UserEmbeddingDataset(Dataset):
 
         for fpath in files:
             try:
-                data = torch.load(fpath, map_location="cpu")
+                data = torch.load(fpath, map_location="cpu", weights_only=False)
                 T = data["embeddings"].size(0)
                 if T < min_timesteps:
                     continue
@@ -177,7 +177,7 @@ class UserEmbeddingDataset(Dataset):
     def _load(self, file_idx: int) -> dict:
         """取用户数据 (懒加载或缓存)"""
         if self.lazy_load:
-            return torch.load(self.files[file_idx], map_location="cpu")
+            return torch.load(self.files[file_idx], map_location="cpu", weights_only=False)
         return self.cached_data[file_idx]
 
     def __len__(self) -> int:

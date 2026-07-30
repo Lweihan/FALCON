@@ -53,7 +53,7 @@ def load_checkpoint(
     device: str = "cpu",
 ) -> dict:
     """加载 checkpoint"""
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
     if optimizer is not None and "optimizer_state_dict" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])

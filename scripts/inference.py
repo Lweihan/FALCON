@@ -46,13 +46,13 @@ def fm_inference(args):
 
     model = FlowMatchingModel.from_config(config.fm, dropout_override=0.0).to(device)
 
-    ckpt = torch.load(args.fm_checkpoint, map_location=device)
+    ckpt = torch.load(args.fm_checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(ckpt['model_state_dict'])
     model.eval()
     logger.info(f"FM 模型加载: {args.fm_checkpoint}")
 
     if args.embedding_file:
-        data = torch.load(args.embedding_file, map_location='cpu')
+        data = torch.load(args.embedding_file, map_location='cpu', weights_only=False)
         embeddings = data['embeddings']
         times = data['times']
         T = embeddings.size(0)

@@ -78,61 +78,182 @@ class JointPostTrainer:
 
     # ── 初始化 ──
 
-    def load_fm(self, fm_checkpoint: Optional[str] = None):
-        """加载预训练 FM 模型。"""
+    def load_fm(self, fm_checkpoint: Optional[str] = None, auto_align_dims: bool = True):
+        """
+        加载预训练 FM 模型。
+
+        Args:
+            fm_checkpoint: checkpoint 路径; None 则随机初始化
+            auto_align_dims: 若 checkpoint 的结构参数 (time_dim / data_dim /
+                dit_dim / ...) 与当前配置不一致, 自动按 checkpoint 重建模型。
+                这样切换不同时期训练的 checkpoint 都不会因 shape mismatch 崩溃。
+                设为 False 则严格使用当前配置, 不匹配时报错。
+        """
         from fm.model import FlowMatchingModel
+
+        if not (fm_checkpoint and os.path.isfile(fm_checkpoint)):
+            self.fm_model = FlowMatchingModel.from_config(self.fcfg).to(self.device)
+            logger.info("FM 随机初始化 (未指定 checkpoint)")
+            self._apply_fm_freeze()
+            return
+
+        # checkpoint 存了 config dict (非纯 tensor), 必须 weights_only=False
+        ckpt = torch.load(fm_checkpoint, map_location=self.device, weights_only=False)
+        state = ckpt.get("model_state_dict", ckpt)
+
+        # ── 结构对齐: 按 checkpoint 修正当前配置 ──
+        if auto_align_dims:
+            self._align_fm_config(ckpt, state)
+
         self.fm_model = FlowMatchingModel.from_config(self.fcfg).to(self.device)
 
-        if fm_checkpoint and os.path.isfile(fm_checkpoint):
-            ckpt = torch.load(fm_checkpoint, map_location=self.device)
-            state = ckpt.get("model_state_dict", ckpt)
+        # ── 维度校验: 避免 strict=False 静默丢弃形状不匹配的权重 ──
+        own_state = self.fm_model.state_dict()
+        shape_mismatch = [
+            (k, tuple(v.shape), tuple(own_state[k].shape))
+            for k, v in state.items()
+            if k in own_state and own_state[k].shape != v.shape
+        ]
 
-            # ── 维度校验: 避免 strict=False 静默丢弃形状不匹配的权重 ──
-            own_state = self.fm_model.state_dict()
-            shape_mismatch = []
-            for k, v in state.items():
-                if k in own_state and own_state[k].shape != v.shape:
-                    shape_mismatch.append((k, tuple(v.shape), tuple(own_state[k].shape)))
-
-            if shape_mismatch:
-                msg_lines = ["FM checkpoint 权重形状不匹配 (共 %d 项):" % len(shape_mismatch)]
-                for k, ck_shape, my_shape in shape_mismatch[:10]:
-                    msg_lines.append(f"  {k}: checkpoint={ck_shape} vs model={my_shape}")
-                if len(shape_mismatch) > 10:
-                    msg_lines.append(f"  ... 还有 {len(shape_mismatch)-10} 项")
-                msg_lines.append("")
-                msg_lines.append("常见原因: fm 配置 (time_dim / data_dim / cond_dim / dit_dim / "
-                                 "dit_depth / dit_num_patches) 与训练该 checkpoint 时不一致。")
-                msg_lines.append(f"当前配置: time_dim={getattr(self.fcfg, 'time_dim', '?')}, "
-                                 f"data_dim={getattr(self.fcfg, 'data_dim', '?')}, "
-                                 f"cond_dim={getattr(self.fcfg, 'cond_dim', '?')}, "
-                                 f"backbone={getattr(self.fcfg, 'backbone_type', '?')}")
-                # 若 checkpoint 里存了配置, 打印出来便于对比
-                ck_cfg = ckpt.get("fm_config") or ckpt.get("config")
-                if isinstance(ck_cfg, dict):
-                    msg_lines.append(
-                        "checkpoint 配置: " + ", ".join(
-                            f"{k}={ck_cfg.get(k)}" for k in
-                            ("time_dim", "data_dim", "cond_dim", "backbone_type",
-                             "dit_dim", "dit_depth", "dit_num_patches")
-                            if k in ck_cfg
-                        )
+        if shape_mismatch:
+            msg_lines = [f"FM checkpoint 权重形状不匹配 (共 {len(shape_mismatch)} 项):"]
+            for k, ck_shape, my_shape in shape_mismatch[:10]:
+                msg_lines.append(f"  {k}: checkpoint={ck_shape} vs model={my_shape}")
+            if len(shape_mismatch) > 10:
+                msg_lines.append(f"  ... 还有 {len(shape_mismatch)-10} 项")
+            msg_lines.append("")
+            msg_lines.append("常见原因: fm 配置 (time_dim / data_dim / cond_dim / dit_dim / "
+                             "dit_depth / dit_num_patches) 与训练该 checkpoint 时不一致。")
+            msg_lines.append(f"当前配置: time_dim={getattr(self.fcfg, 'time_dim', '?')}, "
+                             f"data_dim={getattr(self.fcfg, 'data_dim', '?')}, "
+                             f"cond_dim={getattr(self.fcfg, 'cond_dim', '?')}, "
+                             f"backbone={getattr(self.fcfg, 'backbone_type', '?')}")
+            ck_cfg = ckpt.get("fm_config") or ckpt.get("config")
+            if isinstance(ck_cfg, dict):
+                msg_lines.append(
+                    "checkpoint 配置: " + ", ".join(
+                        f"{k}={ck_cfg.get(k)}" for k in
+                        ("time_dim", "data_dim", "cond_dim", "backbone_type",
+                         "dit_dim", "dit_depth", "dit_num_patches")
+                        if k in ck_cfg
                     )
-                raise ValueError("\n".join(msg_lines))
+                )
+            if not auto_align_dims:
+                msg_lines.append("")
+                msg_lines.append("提示: 可用 load_fm(..., auto_align_dims=True) 自动按 "
+                                 "checkpoint 重建模型。")
+            raise ValueError("\n".join(msg_lines))
 
-            missing, unexpected = self.fm_model.load_state_dict(state, strict=False)
-            logger.info(f"FM checkpoint 加载: {fm_checkpoint}")
-            n_loaded = len([k for k in state if k in own_state])
-            logger.info(f"  成功加载 {n_loaded}/{len(own_state)} 个参数张量")
-            if missing:
-                logger.info(f"  模型新增参数 (checkpoint 中不存在, 随机初始化): "
-                            f"{len(missing)} 项, 前 5: {missing[:5]}")
-            if unexpected:
-                logger.warning(f"  checkpoint 冗余参数 (模型中不存在, 已忽略): "
-                               f"{len(unexpected)} 项, 前 5: {unexpected[:5]}")
+        missing, unexpected = self.fm_model.load_state_dict(state, strict=False)
+        logger.info(f"FM checkpoint 加载: {fm_checkpoint}")
+        n_loaded = len([k for k in state if k in own_state])
+        logger.info(f"  成功加载 {n_loaded}/{len(own_state)} 个参数张量")
+        if missing:
+            logger.info(f"  模型新增参数 (checkpoint 中不存在, 随机初始化): "
+                        f"{len(missing)} 项, 前 5: {missing[:5]}")
+        if unexpected:
+            logger.warning(f"  checkpoint 冗余参数 (模型中不存在, 已忽略): "
+                           f"{len(unexpected)} 项, 前 5: {unexpected[:5]}")
+
+        self._apply_fm_freeze()
+
+    # 会被自动对齐的结构参数 (影响权重形状)
+    _STRUCT_KEYS = (
+        "data_dim", "time_dim", "cond_dim", "backbone_type",
+        "dit_dim", "dit_depth", "dit_heads", "dit_num_patches",
+        "hidden_dim", "num_layers",
+        "transformer_dim", "transformer_depth", "transformer_heads",
+    )
+
+    def _align_fm_config(self, ckpt: dict, state: dict):
+        """
+        按 checkpoint 修正 self.fcfg 的结构参数。
+
+        优先级:
+          1. checkpoint 里存的 fm_config / config dict
+          2. 从 state_dict 权重形状反推 (兼容未存 config 的老 checkpoint)
+        """
+        changed = []
+
+        # ── 来源 1: checkpoint 内嵌配置 ──
+        ck_cfg = ckpt.get("fm_config") or ckpt.get("config")
+        if isinstance(ck_cfg, dict):
+            for k in self._STRUCT_KEYS:
+                if k not in ck_cfg:
+                    continue
+                ck_v, cur_v = ck_cfg[k], getattr(self.fcfg, k, None)
+                if cur_v is not None and ck_v != cur_v:
+                    setattr(self.fcfg, k, ck_v)
+                    changed.append((k, cur_v, ck_v))
+
+            # dit_preset 会在 resolve_dit_params() 里覆盖显式的 dit_* 参数,
+            # 对齐后必须置空, 否则 preset 会把刚对齐的值改回去
+            if any(c[0].startswith("dit_") for c in changed):
+                if getattr(self.fcfg, "dit_preset", "") not in ("", None, "custom"):
+                    old_preset = self.fcfg.dit_preset
+                    self.fcfg.dit_preset = ""
+                    changed.append(("dit_preset", old_preset, "'' (改用显式 dit_* 参数)"))
+
+        # ── 来源 2: 从权重形状反推 (老 checkpoint 未存 config) ──
         else:
-            logger.info("FM 随机初始化 (未指定 checkpoint)")
+            inferred = self._infer_struct_from_state(state)
+            for k, ck_v in inferred.items():
+                cur_v = getattr(self.fcfg, k, None)
+                if cur_v is not None and ck_v != cur_v:
+                    setattr(self.fcfg, k, ck_v)
+                    changed.append((k, cur_v, f"{ck_v} (从权重形状反推)"))
 
+        if changed:
+            logger.warning("FM 结构参数已按 checkpoint 自动对齐:")
+            for k, old, new in changed:
+                logger.warning(f"  {k}: {old} → {new}")
+            logger.warning("如需严格使用当前配置, 请设 load_fm(auto_align_dims=False)")
+        else:
+            logger.info("FM 结构参数与 checkpoint 一致, 无需对齐")
+
+    @staticmethod
+    def _infer_struct_from_state(state: dict) -> dict:
+        """
+        从 state_dict 权重形状反推关键结构参数。
+
+        DiT backbone 的形状关系:
+          velocity_net.time_embed.1.weight    (dit_dim, time_dim)
+          velocity_net.cond_embed.0.weight    (dit_dim, cond_dim)
+          velocity_net.patch_type_embed       (1, num_patches, dit_dim)
+        """
+        out = {}
+
+        w = state.get("velocity_net.time_embed.1.weight")
+        if w is not None and w.dim() == 2:
+            out["dit_dim"] = int(w.shape[0])
+            out["time_dim"] = int(w.shape[1])
+
+        w = state.get("velocity_net.cond_embed.0.weight")
+        if w is not None and w.dim() == 2:
+            out["cond_dim"] = int(w.shape[1])
+
+        w = state.get("velocity_net.patch_type_embed")
+        if w is not None and w.dim() == 3:
+            out["dit_num_patches"] = int(w.shape[1])
+
+        # data_dim = num_patches * patch_dim; patch_embed: (dit_dim, patch_dim)
+        w = state.get("velocity_net.patch_embed.weight")
+        if w is not None and w.dim() == 2 and "dit_num_patches" in out:
+            out["data_dim"] = int(w.shape[1]) * out["dit_num_patches"]
+
+        # DiT block 层数
+        depths = [
+            int(k.split(".")[2])
+            for k in state
+            if k.startswith("velocity_net.blocks.") and len(k.split(".")) > 3
+        ]
+        if depths:
+            out["dit_depth"] = max(depths) + 1
+
+        return out
+
+    def _apply_fm_freeze(self):
+        """按配置冻结 FM 参数并打印统计。"""
         if self.rcfg.freeze_fm:
             for p in self.fm_model.parameters():
                 p.requires_grad = False
@@ -447,7 +568,7 @@ class JointPostTrainer:
 
         CF-OPD 阶段调用此方法获取 joint-trained FM 和 Ranker。
         """
-        ckpt = torch.load(path, map_location=device)
+        ckpt = torch.load(path, map_location=device, weights_only=False)
         logger.info(f"Joint checkpoint 加载: {path}")
         logger.info(f"  Epoch={ckpt.get('epoch')}, "
                     f"val_auc={ckpt.get('val_stats', {}).get('auc', 'N/A')}")

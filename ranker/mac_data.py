@@ -16,7 +16,7 @@ MAC (Multi-domain Ad Click) 数据集字段:
                   要求目录结构:
                     MAC/
                     ├── train/   *.parquet   训练数据
-                    ├── val/     *.parquet   验证数据
+                    ├── test/    *.parquet   验证数据
                     └── vocabs/  {field}.json 每字段一个词表文件
                   parquet 逐行组流式读取, 不会一次性加载到内存
   hf_streaming    直接从 HuggingFace Hub 流式读取 (无需下载)
@@ -509,7 +509,8 @@ def build_vocab_from_mac(
 
     if load_mode == "local_dir":
         ds = ParquetDirIterable(
-            os.path.join(data_path, train_subdir), batch_size=parquet_batch_size
+            _resolve_subdir(data_path, train_subdir, ["train"]),
+            batch_size=parquet_batch_size,
         )
     elif load_mode in ("hf_streaming", "hf_download"):
         streaming = (load_mode == "hf_streaming")
@@ -528,6 +529,35 @@ def build_vocab_from_mac(
     return vocab
 
 
+def _resolve_subdir(root: str, configured: str, fallbacks: List[str]) -> str:
+    """
+    解析子目录路径, 支持命名兜底。
+
+    优先用配置指定的名字; 若不存在则依次尝试 fallbacks
+    (如 test / val / valid), 避免因目录命名差异导致训练中断。
+
+    Returns:
+        实际存在的目录路径; 全都不存在时返回配置指定的路径
+        (让后续 ParquetDirIterable / load_from_dir 抛出明确错误)
+    """
+    primary = os.path.join(root, configured)
+    if os.path.isdir(primary):
+        return primary
+
+    for name in fallbacks:
+        if name == configured:
+            continue
+        alt = os.path.join(root, name)
+        if os.path.isdir(alt):
+            logger.warning(
+                f"子目录 '{configured}/' 不存在, 自动改用 '{name}/' "
+                f"(可通过配置 mac_*_subdir 显式指定)"
+            )
+            return alt
+
+    return primary
+
+
 def create_mac_dataloaders(
     ranker_config,
     vocab: Optional[FeatureVocab] = None,
@@ -539,8 +569,8 @@ def create_mac_dataloaders(
     local_dir 模式 (推荐, 默认):
         {mac_data_path}/
           {mac_train_subdir}/   *.parquet   → train_loader
-          {mac_val_subdir}/     *.parquet   → val_loader
-          {mac_vocab_subdir}/   {field}.json → vocab
+          {mac_val_subdir}/     *.parquet   → val_loader   (默认 test/)
+          {mac_vocab_subdir}/   {field}.json → vocab        (默认 vocabs/)
 
     Args:
         ranker_config: RankerConfig
@@ -564,13 +594,13 @@ def create_mac_dataloaders(
         if not os.path.isdir(root):
             raise FileNotFoundError(f"MAC 根目录不存在: {root}")
 
-        train_dir = os.path.join(root, cfg.mac_train_subdir)
-        val_dir = os.path.join(root, cfg.mac_val_subdir)
-        vocab_dir = os.path.join(root, cfg.mac_vocab_subdir)
+        train_dir = _resolve_subdir(root, cfg.mac_train_subdir, ["train"])
+        val_dir = _resolve_subdir(root, cfg.mac_val_subdir, ["test", "val", "valid"])
+        vocab_dir = _resolve_subdir(root, cfg.mac_vocab_subdir, ["vocabs", "vocab"])
 
         logger.info(f"MAC local_dir 模式: {root}")
         logger.info(f"  train: {train_dir}")
-        logger.info(f"  val:   {val_dir}")
+        logger.info(f"  eval:  {val_dir}")
         logger.info(f"  vocab: {vocab_dir}")
 
         # ── 词表: 优先读 vocabs/ 目录 ──

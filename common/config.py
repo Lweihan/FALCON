@@ -35,8 +35,9 @@ class FMConfig:
     """Flow Matching (Teacher) 配置"""
     data_dim: int = 256           # 数据维度 (= LatentConfig.fusion_output_dim)
     # 时间编码维度: 必须与 checkpoint 保存时一致, 否则 time_embed.1 权重形状不匹配
-    # 所有 backbone (dit/transformer/mlp) 统一使用 256
-    time_dim: int = 256
+    # 若加载的 checkpoint 维度不同, JointPostTrainer.load_fm(auto_align_dims=True)
+    # 会自动按 checkpoint 重建模型
+    time_dim: int = 128
     cond_dim: int = 256          # 条件维度 (= data_dim)
     # Backbone 选择: dit (推荐) / transformer / mlp
     backbone_type: str = "dit"
@@ -285,15 +286,15 @@ class RankerConfig:
     num_workers: int = 4
     # MAC 数据集专属
     # load_mode:
-    #   local_dir     从本地 MAC 目录加载 (推荐; 需 train/ val/ vocabs/ 子目录)
+    #   local_dir     从本地 MAC 目录加载 (推荐; 需 train/ test/ vocabs/ 子目录)
     #   hf_streaming  直接从 HuggingFace 流式读 (无需下载)
     #   hf_download   先下载到本地缓存 (~80GB)
     #   local_parquet 单个 parquet 文件
     #   local_csv     单个 csv 文件
     mac_load_mode: str = "local_dir"
     mac_data_path: str = ""          # local_dir: MAC 根目录; local_*: 单文件路径
-    mac_train_subdir: str = "train"  # 训练数据子目录 (local_dir 模式)
-    mac_val_subdir: str = "val"      # 验证数据子目录 (local_dir 模式)
+    mac_train_subdir: str = "train"   # 训练数据子目录 (local_dir 模式)
+    mac_val_subdir: str = "test"     # 验证数据子目录 (MAC 数据集用 test/)
     mac_vocab_subdir: str = "vocabs"  # 词表子目录, 每字段一个 json (local_dir 模式)
     mac_parquet_batch_size: int = 10000   # parquet 流式读取的行组大小
     mac_label: str = "last"          # CVR 标签: linear / mta / first / last

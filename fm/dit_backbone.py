@@ -366,7 +366,7 @@ class DiTVelocityNetwork(nn.Module):
         dropout: float = 0.0,
         qk_norm: bool = True,
         use_rope: bool = True,
-        time_dim: int = 256,
+        time_dim: int = 128,
         use_gradient_checkpointing: bool = False,
     ):
         super().__init__()

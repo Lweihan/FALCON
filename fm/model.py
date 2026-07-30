@@ -30,7 +30,7 @@ class FlowMatchingModel(torch.nn.Module):
     def __init__(
         self,
         data_dim: int = 256,
-        time_dim: int = 256,
+        time_dim: int = 128,
         cond_dim: int = 256,
         backbone_type: str = "dit",
         # ── DiT 参数 ──

@@ -48,7 +48,7 @@ posttrain.py — FALCON 后训练主脚本
 MAC 目录结构 (local_dir 模式, 默认):
   MAC/
   ├── train/   *.parquet
-  ├── val/     *.parquet
+  ├── test/    *.parquet
   └── vocabs/  {field}.json
 """
 
@@ -101,12 +101,12 @@ def parse_args():
         "--mac_load_mode",
         default="local_dir",
         choices=["local_dir", "hf_streaming", "hf_download", "local_parquet", "local_csv"],
-        help="MAC 数据集加载模式 (local_dir 推荐: 需 train/ val/ vocabs/ 子目录)",
+        help="MAC 数据集加载模式 (local_dir 推荐: 需 train/ test/ vocabs/ 子目录)",
     )
     parser.add_argument("--mac_data_path", default="",
                         help="local_dir: MAC 根目录; local_parquet/csv: 单文件路径")
     parser.add_argument("--mac_train_subdir", default="train", help="训练数据子目录")
-    parser.add_argument("--mac_val_subdir", default="val", help="验证数据子目录")
+    parser.add_argument("--mac_val_subdir", default="test", help="验证数据子目录")
     parser.add_argument("--mac_vocab_subdir", default="vocabs", help="词表子目录")
     parser.add_argument("--mac_parquet_batch_size", type=int, default=None,
                         help="parquet 流式读取行组大小 (默认 10000)")
@@ -309,10 +309,11 @@ def run_cf_opd(cfg: FALCONConfig, device: str):
     # 词表 (必须有): 优先从 MAC/vocabs/ 目录加载, 否则读独立 json
     from ranker.mac_data import (
         FeatureVocab, SPARSE_FIELDS, SEQ_ID_FIELDS, SEQ_FLOAT_FIELDS,
+        _resolve_subdir,
     )
 
     vocab = None
-    vocab_dir = (os.path.join(rc.mac_data_path, rc.mac_vocab_subdir)
+    vocab_dir = (_resolve_subdir(rc.mac_data_path, rc.mac_vocab_subdir, ["vocabs", "vocab"])
                  if rc.mac_data_path else "")
     if vocab_dir and os.path.isdir(vocab_dir):
         vocab = FeatureVocab.load_from_dir(vocab_dir)
@@ -422,7 +423,7 @@ def _run_cf_opd_loop(engine, student, cfg, output_dir: str, device: str):
         for emb_file in emb_files:
             # 加载 condition embedding
             if emb_file.endswith(".pt"):
-                data = torch.load(emb_file, map_location=device)
+                data = torch.load(emb_file, map_location=device, weights_only=False)
                 # 支持 dict 格式 {"condition": tensor} 或直接是 tensor
                 if isinstance(data, dict):
                     cond_emb = data.get("condition", data.get("embedding", None))

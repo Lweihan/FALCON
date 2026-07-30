@@ -141,6 +141,6 @@ class LatentPipeline:
 
     def load_fusion_state(self, path: str):
         """加载预训练的融合模块权重"""
-        state = torch.load(path, map_location=self.device)
+        state = torch.load(path, map_location=self.device, weights_only=False)
         self.fusion.load_state_dict(state)
         logger.info(f"加载 fusion 权重: {path}")

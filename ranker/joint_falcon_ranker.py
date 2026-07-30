@@ -95,7 +95,7 @@ class JointFALCONRanker(nn.Module):
     def _load_fm_checkpoint(self, path: str, device: str):
         """加载预训练 FM 权重 (容错: 允许部分不匹配)"""
         try:
-            ckpt = torch.load(path, map_location=device)
+            ckpt = torch.load(path, map_location=device, weights_only=False)
             state = ckpt.get("model_state_dict", ckpt)
             missing, unexpected = self.fm_model.load_state_dict(state, strict=False)
             logger.info(f"FM checkpoint 加载: {path}")
