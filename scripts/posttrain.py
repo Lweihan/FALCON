@@ -49,7 +49,7 @@ MAC 目录结构 (local_dir 模式, 默认):
   MAC/
   ├── train/   *.parquet
   ├── val/     *.parquet
-  └── vocab/   {field}.json
+  └── vocabs/  {field}.json
 """
 
 import argparse
@@ -101,13 +101,13 @@ def parse_args():
         "--mac_load_mode",
         default="local_dir",
         choices=["local_dir", "hf_streaming", "hf_download", "local_parquet", "local_csv"],
-        help="MAC 数据集加载模式 (local_dir 推荐: 需 train/ val/ vocab/ 子目录)",
+        help="MAC 数据集加载模式 (local_dir 推荐: 需 train/ val/ vocabs/ 子目录)",
     )
     parser.add_argument("--mac_data_path", default="",
                         help="local_dir: MAC 根目录; local_parquet/csv: 单文件路径")
     parser.add_argument("--mac_train_subdir", default="train", help="训练数据子目录")
     parser.add_argument("--mac_val_subdir", default="val", help="验证数据子目录")
-    parser.add_argument("--mac_vocab_subdir", default="vocab", help="词表子目录")
+    parser.add_argument("--mac_vocab_subdir", default="vocabs", help="词表子目录")
     parser.add_argument("--mac_parquet_batch_size", type=int, default=None,
                         help="parquet 流式读取行组大小 (默认 10000)")
     parser.add_argument(
@@ -306,7 +306,7 @@ def run_cf_opd(cfg: FALCONConfig, device: str):
         if hasattr(rc, k):
             setattr(rc, k, v)
 
-    # 词表 (必须有): 优先从 MAC/vocab/ 目录加载, 否则读独立 json
+    # 词表 (必须有): 优先从 MAC/vocabs/ 目录加载, 否则读独立 json
     from ranker.mac_data import (
         FeatureVocab, SPARSE_FIELDS, SEQ_ID_FIELDS, SEQ_FLOAT_FIELDS,
     )

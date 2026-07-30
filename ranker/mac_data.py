@@ -17,7 +17,7 @@ MAC (Multi-domain Ad Click) 数据集字段:
                     MAC/
                     ├── train/   *.parquet   训练数据
                     ├── val/     *.parquet   验证数据
-                    └── vocab/   {field}.json 每字段一个词表文件
+                    └── vocabs/  {field}.json 每字段一个词表文件
                   parquet 逐行组流式读取, 不会一次性加载到内存
   hf_streaming    直接从 HuggingFace Hub 流式读取 (无需下载)
   hf_download     先下载到本地缓存 (~80GB), 再读取
@@ -148,8 +148,8 @@ class FeatureVocab:
         """
         从词表目录加载 (每个字段一个 json 文件)。
 
-        MAC 数据集的 vocab/ 目录结构:
-            vocab/
+        MAC 数据集的 vocabs/ 目录结构:
+            vocabs/
               user_id.json
               user_feat0.json
               ...
@@ -499,7 +499,7 @@ def build_vocab_from_mac(
     扫描 MAC 数据集构建词表 (fallback 路径)。
 
     local_dir 模式下应优先使用 FeatureVocab.load_from_dir() 读取预置词表,
-    只有在 vocab/ 目录缺失时才走这里。
+    只有在 vocabs/ 目录缺失时才走这里。
 
     Args:
         max_rows: 最多扫描的行数
@@ -573,7 +573,7 @@ def create_mac_dataloaders(
         logger.info(f"  val:   {val_dir}")
         logger.info(f"  vocab: {vocab_dir}")
 
-        # ── 词表: 优先读 vocab/ 目录 ──
+        # ── 词表: 优先读 vocabs/ 目录 ──
         if vocab is None:
             if os.path.isdir(vocab_dir):
                 vocab = FeatureVocab.load_from_dir(vocab_dir)

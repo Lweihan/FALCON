@@ -285,7 +285,7 @@ class RankerConfig:
     num_workers: int = 4
     # MAC 数据集专属
     # load_mode:
-    #   local_dir     从本地 MAC 目录加载 (推荐; 需 train/ val/ vocab/ 子目录)
+    #   local_dir     从本地 MAC 目录加载 (推荐; 需 train/ val/ vocabs/ 子目录)
     #   hf_streaming  直接从 HuggingFace 流式读 (无需下载)
     #   hf_download   先下载到本地缓存 (~80GB)
     #   local_parquet 单个 parquet 文件
@@ -294,7 +294,7 @@ class RankerConfig:
     mac_data_path: str = ""          # local_dir: MAC 根目录; local_*: 单文件路径
     mac_train_subdir: str = "train"  # 训练数据子目录 (local_dir 模式)
     mac_val_subdir: str = "val"      # 验证数据子目录 (local_dir 模式)
-    mac_vocab_subdir: str = "vocab"  # 词表子目录, 每字段一个 json (local_dir 模式)
+    mac_vocab_subdir: str = "vocabs"  # 词表子目录, 每字段一个 json (local_dir 模式)
     mac_parquet_batch_size: int = 10000   # parquet 流式读取的行组大小
     mac_label: str = "last"          # CVR 标签: linear / mta / first / last
     mac_vocab_path: str = ""         # 独立词表 json 路径 (非 local_dir 模式)
