@@ -273,9 +273,16 @@ class RankerConfig:
     epochs: int = 3
     batch_size: int = 1024
     lr: float = 1e-3
-    weight_decay: float = 1e-5
+    # weight_decay: 只对 2D 权重矩阵生效, bias/LayerNorm/Embedding 不衰减
+    # (标准做法, 否则会退化嵌入向量)
+    weight_decay: float = 0.01
     grad_clip: float = 5.0
-    early_stop_patience: int = 2
+    # Early stopping
+    early_stop_patience: int = 3          # 连续 N 个 epoch 未改善即停; 0 = 禁用
+    early_stop_min_delta: float = 1e-4    # 视为改善的最小指标提升
+    # LR scheduler
+    lr_scheduler: str = "cosine"          # none / cosine / linear
+    warmup_ratio: float = 0.03            # 首 3% steps 做 linear warmup
     grad_accum: int = 4
     use_amp: bool = True
     save_every: int = 1

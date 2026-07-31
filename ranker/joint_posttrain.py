@@ -29,13 +29,13 @@ FALCON 后训练 Stage 1:
 import json
 import os
 import time
-from typing import Optional
+from typing import Dict, List, Optional
 
 import torch
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
 try:
     from torch.utils.tensorboard import SummaryWriter
     _HAS_TB = True
@@ -118,6 +118,13 @@ class JointPostTrainer:
         self._label_mode = getattr(ranker_config, "mac_label_mode", "binary")
         self._cvr_loss_name = "BCEWithLogits"
         self._max_steps = -1   # DDP step 对齐上限, -1 = 不限制
+        # NaN/Inf loss 计数 (超阈值判定训练失控)
+        self._nonfinite_loss_count = 0
+        self._NONFINITE_MAX = 20
+        # LR scheduler 在 train() 中根据配置构造
+        self._lr_scheduler = None
+        # Early stop 状态
+        self._no_improve_epochs = 0
 
     def _log(self, msg: str, level: str = "info"):
         """只在主进程打印"""
@@ -406,6 +413,111 @@ class JointPostTrainer:
 
         self._log(f"  DDP 包装完成 (find_unused_parameters={find_unused})")
 
+    # ────────────────────────────────────────────────────────────
+    # Optimizer / Scheduler 构建
+    # ────────────────────────────────────────────────────────────
+
+    def _build_param_groups(self, weight_decay: float) -> List[Dict]:
+        """
+        构造 optimizer 的参数分组:
+          - decay 组:    2D 权重矩阵 (Linear.weight 等), 施加 weight_decay
+          - no_decay 组: bias / LayerNorm / Embedding, weight_decay=0
+
+        为何要分组:
+          weight decay 对 embedding / bias / norm 有害:
+            1. embedding: WD 会把嵌入向量往 0 拉, 退化表示能力
+            2. bias:      本就是标量偏置, 拉向 0 相当于减小自由度, 无正则意义
+            3. LayerNorm: gain/bias 参数是逐通道缩放, 拉向 0 会破坏归一化
+          只对 Linear/Conv 的 2D+ 权重矩阵施加 WD 才是标准做法
+          (GPT/LLaMA/BERT 等训练脚本均如此)。
+
+        参考: https://github.com/karpathy/nanoGPT (get_optim_groups)
+        """
+        decay, no_decay = [], []
+        decay_names, no_decay_names = [], []
+
+        # 收集所有 Embedding / LayerNorm 参数的 id, 用于精确判断 (不依赖命名)
+        norm_embed_ids = set()
+        for module in [self.fm_model, self.ranker, self.cond_proj]:
+            for m in module.modules():
+                if isinstance(m, (nn.Embedding, nn.LayerNorm, nn.BatchNorm1d,
+                                  nn.BatchNorm2d, nn.GroupNorm)):
+                    for p in m.parameters(recurse=False):
+                        norm_embed_ids.add(id(p))
+
+        for name_prefix, module in [
+            ("fm", self.fm_model),
+            ("ranker", self.ranker),
+            ("cond_proj", self.cond_proj),
+        ]:
+            for pname, p in module.named_parameters():
+                if not p.requires_grad:
+                    continue
+                full = f"{name_prefix}.{pname}"
+                # 判据 (任一满足即不衰减):
+                #   a) 参数属于 Embedding / *Norm 模块 (类型判断, 最可靠)
+                #   b) 参数是 <2D 张量 (bias / gain 类)
+                #   c) 名字含 "bias" (兜底, 覆盖自定义模块)
+                if id(p) in norm_embed_ids or p.ndim < 2 \
+                        or "bias" in pname.lower():
+                    no_decay.append(p)
+                    no_decay_names.append(full)
+                else:
+                    decay.append(p)
+                    decay_names.append(full)
+
+        n_decay = sum(p.numel() for p in decay)
+        n_no_decay = sum(p.numel() for p in no_decay)
+        self._log(f"  Optimizer 分组: "
+                  f"decay={len(decay)} tensors / {n_decay:,} params, "
+                  f"no_decay={len(no_decay)} tensors / {n_no_decay:,} params")
+
+        return [
+            {"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
+
+    def _build_lr_scheduler(self, optimizer, total_steps: int,
+                            kind: str = "cosine",
+                            warmup_ratio: float = 0.03):
+        """
+        构造 LR scheduler: linear warmup + cosine/linear decay。
+
+        为何要 warmup:
+          训练初期梯度方向噪声大, 直接大 lr 容易把权重推到坏点 (尤其 AMP fp16)。
+          Warmup 让 lr 从 0 线性升到目标值, 给优化器几百步"稳态启动"。
+
+        为何 cosine 而非 step decay:
+          Cosine 平滑, 无突变的 loss spike; 在最后阶段 lr → ~0, 相当于
+          fine-tune 状态, 对过拟合场景 (train↓/val↓) 起收敛稳态作用。
+
+        Args:
+            total_steps:  整个训练的总 optimizer 步数 (epochs × steps_per_epoch)
+            kind:         "cosine" / "linear" / "none"
+            warmup_ratio: warmup 步数占比 (0.03 = 前 3%)
+        """
+        if kind == "none" or total_steps <= 0:
+            return None
+
+        import math
+        from torch.optim.lr_scheduler import LambdaLR
+
+        warmup_steps = max(int(total_steps * warmup_ratio), 1)
+
+        def lr_lambda(step: int) -> float:
+            if step < warmup_steps:
+                return step / warmup_steps
+            progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+            progress = min(max(progress, 0.0), 1.0)
+            if kind == "cosine":
+                # cosine: 1 → 0 (曲线过 0.5 处对应半程)
+                return 0.5 * (1.0 + math.cos(math.pi * progress))
+            elif kind == "linear":
+                return max(1.0 - progress, 0.0)
+            return 1.0
+
+        return LambdaLR(optimizer, lr_lambda)
+
     def _precompute_max_steps(self, loader) -> int:
         """
         训练开始前算出各 rank 的 step 数, 取全局最小值。
@@ -545,12 +657,10 @@ class JointPostTrainer:
         # ── DDP 包装 ──
         self._wrap_ddp()
 
-        all_params = (list(self.fm_model.parameters())
-                      + list(self.ranker.parameters())
-                      + list(self.cond_proj.parameters()))
-        trainable_params = [p for p in all_params if p.requires_grad]
-        optimizer = AdamW(trainable_params, lr=cfg.lr, weight_decay=cfg.weight_decay)
-        scheduler = CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=cfg.lr * 0.01)
+        # ── Optimizer 参数分组: 只对 2D 权重矩阵施加 weight_decay ──
+        # bias / LayerNorm / Embedding 不衰减 (标准做法, 否则会退化嵌入向量)
+        param_groups = self._build_param_groups(cfg.weight_decay)
+        optimizer = AdamW(param_groups, lr=cfg.lr)
 
         use_amp = cfg.use_amp and "cuda" in str(self.device)
         scaler = _make_grad_scaler(use_amp)
@@ -564,12 +674,33 @@ class JointPostTrainer:
         self._log(f"  标签模式: {self._label_mode}; "
                   f"CVR loss: {self._cvr_loss_name}; "
                   f"best 判据: {best_metric} ({'越大' if best_higher else '越小'}越好)")
+        self._log(f"  weight_decay={cfg.weight_decay} (仅对 2D 权重, "
+                  f"bias/norm/embedding 不衰减)")
+        self._log(f"  early_stop: patience={cfg.early_stop_patience}, "
+                  f"min_delta={cfg.early_stop_min_delta}")
 
         global_step = 0
         log_history = []
         # DDP 下各 rank 数据量可能不均 → step 数不一致会在 all_reduce 处死锁。
         # 必须在训练开始前 (而非首个 epoch 后) 就算出全局最小 step 数。
         self._max_steps = self._precompute_max_steps(train_loader)
+
+        # ── LR Scheduler: 按 step 更新 (linear warmup + cosine/linear decay) ──
+        # 单卡时 _max_steps=-1, 用 _estimate_steps 兜底
+        steps_per_epoch = (self._max_steps if self._max_steps > 0
+                           else (self._estimate_steps(train_loader) or 1000))
+        total_steps = steps_per_epoch * cfg.epochs
+        self._lr_scheduler = self._build_lr_scheduler(
+            optimizer, total_steps,
+            kind=cfg.lr_scheduler,
+            warmup_ratio=cfg.warmup_ratio,
+        )
+        self._log(f"  LR scheduler: {cfg.lr_scheduler}, "
+                  f"warmup {int(total_steps * cfg.warmup_ratio)}/{total_steps} steps")
+
+        # 记录 Δmetric 需要保存上一 epoch 的值
+        prev_metrics: Dict[str, float] = {}
+        self._no_improve_epochs = 0
 
         for epoch in range(1, cfg.epochs + 1):
             t0 = time.time()
@@ -584,23 +715,44 @@ class JointPostTrainer:
             global_step += steps
 
             val_stats = self._validate(val_loader, cvr_loss_fn)
-            scheduler.step()
 
             elapsed = time.time() - t0
-            lr = scheduler.get_last_lr()[0]
+            lr = optimizer.param_groups[0]["lr"]
 
-            # 指标摘要 (随模式变化)
-            metric_str = " ".join(
-                f"val_{k}={v:.4f}" for k, v in val_stats.items()
-                if k not in ("avg_loss",)
-            )
+            # 指标摘要 + Δ 标记 (随模式变化)
+            metric_parts = []
+            for k, v in val_stats.items():
+                if k == "avg_loss":
+                    continue
+                prev = prev_metrics.get(k)
+                if prev is not None:
+                    delta = v - prev
+                    arrow = "↓" if delta < 0 else ("↑" if delta > 0 else "=")
+                    metric_parts.append(f"val_{k}={v:.4f}(Δ={delta:+.4f}{arrow})")
+                else:
+                    metric_parts.append(f"val_{k}={v:.4f}")
+            metric_str = " ".join(metric_parts)
+
+            # train loss 也带 Δ
+            prev_tl = prev_metrics.get("_train_loss")
+            tl_delta_str = ""
+            if prev_tl is not None:
+                dl = train_stats["avg_loss"] - prev_tl
+                tl_delta_str = f"(Δ={dl:+.4f})"
+
             self._log(
                 f"Epoch {epoch}/{cfg.epochs} ({elapsed:.1f}s, {steps} steps) | "
-                f"train_loss={train_stats['avg_loss']:.4f} "
+                f"train_loss={train_stats['avg_loss']:.4f}{tl_delta_str} "
                 f"(cvr={train_stats['avg_cvr_loss']:.4f}, "
                 f"flow={train_stats['avg_flow_loss']:.4f}) | "
                 f"{metric_str} | lr={lr:.2e}"
             )
+
+            # 更新 prev_metrics
+            prev_metrics["_train_loss"] = train_stats["avg_loss"]
+            for k, v in val_stats.items():
+                if k != "avg_loss":
+                    prev_metrics[k] = v
 
             writer.add_scalar("epoch/train_loss", train_stats["avg_loss"], epoch)
             writer.add_scalar("epoch/cvr_loss", train_stats["avg_cvr_loss"], epoch)
@@ -620,21 +772,53 @@ class JointPostTrainer:
                 "lr": lr, "seconds": elapsed, "steps": steps,
             })
 
-            # 保存只在主进程 (val_stats 已 all_reduce, 各 rank 判据一致)
+            # ── best 判定 + early stopping ──
             cur = val_stats.get(best_metric)
+            improved = False
             if cur is not None:
-                improved = (cur > best_value) if best_higher else (cur < best_value)
+                # 使用 min_delta: 差异小于阈值不算改善, 防止指标震荡触发假 improvement
+                if best_higher:
+                    improved = cur > best_value + cfg.early_stop_min_delta
+                else:
+                    improved = cur < best_value - cfg.early_stop_min_delta
+
                 if improved:
                     best_value = cur
+                    self._no_improve_epochs = 0
                     if self._is_main:
                         self._save_joint(output_dir, "best_joint.pt",
                                          optimizer, epoch, val_stats)
                         logger.info(f"  * 新最佳 {best_metric}={best_value:.4f}")
+                else:
+                    self._no_improve_epochs += 1
+                    self._log(
+                        f"  {best_metric}={cur:.4f} 未改善 (best={best_value:.4f}, "
+                        f"连续 {self._no_improve_epochs}/{cfg.early_stop_patience})"
+                    )
 
             if epoch % cfg.save_every == 0 and self._is_main:
                 self._save_joint(output_dir, f"joint_epoch_{epoch}.pt",
                                  optimizer, epoch, val_stats)
             barrier()   # 等主进程写完再进入下一 epoch
+
+            # Early stop 判定 (DDP 下需广播, 保证所有 rank 同步退出循环)
+            if cfg.early_stop_patience > 0 and \
+                    self._no_improve_epochs >= cfg.early_stop_patience:
+                should_stop = True
+            else:
+                should_stop = False
+            if self.distributed:
+                import torch.distributed as dist
+                t = torch.tensor([int(should_stop)],
+                                 dtype=torch.long, device=self.device)
+                dist.all_reduce(t, op=dist.ReduceOp.MAX)
+                should_stop = bool(t.item())
+            if should_stop:
+                self._log(
+                    f"Early stop: 连续 {cfg.early_stop_patience} epoch "
+                    f"{best_metric} 未改善 (best={best_value:.4f}), 提前结束训练"
+                )
+                break
 
         writer.close()
         if self._is_main:
@@ -746,25 +930,69 @@ class JointPostTrainer:
                     loss_dict = self._compute_joint_loss(
                         sparse_ids, seq_id_lists, mm_feats, labels, cvr_loss_fn, alpha
                     )
-                scaler.scale(loss_dict["loss"] / accum).backward()
+                loss = loss_dict["loss"]
             else:
                 loss_dict = self._compute_joint_loss(
                     sparse_ids, seq_id_lists, mm_feats, labels, cvr_loss_fn, alpha
                 )
-                (loss_dict["loss"] / accum).backward()
+                loss = loss_dict["loss"]
+
+            # ── NaN/Inf loss 检测 (第二道防线) ──
+            # 即便数据入口已清 NaN, AMP fp16 溢出、梯度爆炸后的权重坏死等
+            # 仍可能产出非有限 loss。此时 backward 会污染所有 rank 的权重,
+            # 必须 skip 该 step。累计计数, 超阈值报错停止 (真实失控)。
+            if not torch.isfinite(loss):
+                self._nonfinite_loss_count += 1
+                if self._nonfinite_loss_count > self._NONFINITE_MAX:
+                    raise RuntimeError(
+                        f"连续 {self._nonfinite_loss_count} 步 loss=NaN/Inf, "
+                        "训练已失控。请检查:\n"
+                        "  1. lr 是否过大 (建议 <= 1e-3)\n"
+                        "  2. AMP fp16 是否溢出 (可关闭 use_amp 排查)\n"
+                        "  3. 数据是否有极端值 (查看 dataset 的 NaN 统计)"
+                    )
+                self._log(f"  step {batch_idx}: loss={loss.item()}, skip",
+                          level="warning")
+                optimizer.zero_grad(set_to_none=True)
+                # accum 中间步 skip 会导致累积梯度残留 -> 一起清掉
+                continue
+            else:
+                # 遇到 finite loss 就重置计数 (只关心"连续"非有限)
+                self._nonfinite_loss_count = 0
+
+            if scaler:
+                scaler.scale(loss / accum).backward()
+            else:
+                (loss / accum).backward()
 
             if not is_accum_step:
                 if scaler:
                     if cfg.grad_clip > 0:
                         scaler.unscale_(optimizer)
-                        nn.utils.clip_grad_norm_(clip_params, cfg.grad_clip)
+                        # 记录裁剪前梯度范数, 用于监控爆炸
+                        gnorm = nn.utils.clip_grad_norm_(clip_params, cfg.grad_clip)
+                    else:
+                        gnorm = None
                     scaler.step(optimizer)
                     scaler.update()
                 else:
+                    gnorm = None
                     if cfg.grad_clip > 0:
-                        nn.utils.clip_grad_norm_(clip_params, cfg.grad_clip)
+                        gnorm = nn.utils.clip_grad_norm_(clip_params, cfg.grad_clip)
                     optimizer.step()
+                # LR scheduler: 每次 optimizer.step 后调用一次
+                if self._lr_scheduler is not None:
+                    self._lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+
+                # TensorBoard: 记录 lr / grad_norm (仅 optimizer step 时有)
+                step_glob = step_offset + n + 1
+                if self._is_main:
+                    writer.add_scalar(
+                        "step/lr", optimizer.param_groups[0]["lr"], step_glob
+                    )
+                    if gnorm is not None and torch.isfinite(gnorm):
+                        writer.add_scalar("step/grad_norm", gnorm.item(), step_glob)
 
             total_loss += loss_dict["loss"].item()
             total_cvr += loss_dict["cvr_loss"].item()
@@ -922,6 +1150,15 @@ class JointPostTrainer:
         if not all_labels:
             self._log("验证集为空, 跳过指标计算", level="warning")
             return stats
+
+        # 整体 NaN 健康度检查 (指标层还会各自过滤, 此处只做告警)
+        n_bad_prob = sum(1 for p in all_probs if not np.isfinite(p))
+        n_bad_lbl = sum(1 for x in all_labels if not np.isfinite(x))
+        if n_bad_prob or n_bad_lbl:
+            self._logw(
+                f"验证集含 NaN/Inf: prob={n_bad_prob}/{len(all_probs)}, "
+                f"label={n_bad_lbl}/{len(all_labels)}; 指标计算将自动过滤"
+            )
 
         from ranker.metrics import (
             compute_auc, compute_gauc, compute_logloss, compute_pos_rate,

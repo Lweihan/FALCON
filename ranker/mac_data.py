@@ -285,10 +285,39 @@ class MACIterableDataset(IterableDataset):
         self.label_mode = label_mode
         self.label_threshold = label_threshold
 
+        # NaN/Inf 统计: MAC 的 mm_feat0_seq / mm_feat1_seq 是真实多模态特征,
+        # 存在缺失/异常值。经平均池化后 NaN 会传染整个样本 embedding,
+        # 训练时导致 loss=NaN, 验证时导致 sklearn 崩溃。
+        # 每 _nan_warn_interval 条样本 rank 0 累计打印一次警告。
+        self._nan_bad_values = 0     # 累计被替换的 NaN/Inf 值个数
+        self._nan_bad_samples = 0    # 累计触及 NaN 的样本数
+        self._nan_total_samples = 0
+        self._nan_warn_interval = 10000
+
         if label_mode not in ("binary", "continuous"):
             raise ValueError(
                 f"label_mode 必须是 binary / continuous, got {label_mode!r}"
             )
+
+    def _maybe_warn_nan(self):
+        """
+        rank 0 定期汇报 NaN 统计。DDP 下每个 rank 独立打印, 加 rank 前缀。
+        """
+        from common.distributed import is_main_process, get_rank
+        if not is_main_process():
+            return
+        if self._nan_bad_samples == 0:
+            return
+        ratio = self._nan_bad_samples / max(self._nan_total_samples, 1)
+        # 超过 1% 认为异常; 需上游检查
+        level = "warning" if ratio > 0.01 else "debug"
+        msg = (f"[数据 NaN] 已扫描 {self._nan_total_samples:,} 样本, "
+               f"{self._nan_bad_samples:,} ({ratio:.2%}) 含 NaN/Inf, "
+               f"共清理 {self._nan_bad_values:,} 个异常值")
+        if level == "warning":
+            logger.warning(msg)
+        else:
+            logger.debug(msg)
 
     def _transform_label(self, raw: float) -> float:
         """
@@ -302,32 +331,49 @@ class MACIterableDataset(IterableDataset):
             return float(raw > self.label_threshold)
         return float(min(max(raw, 0.0), 1.0))
 
-    def _pool_float_seq(self, seq) -> np.ndarray:
+    def _pool_float_seq(self, seq) -> Tuple[np.ndarray, int]:
         """
-        对实值序列做 pool, 返回 1D numpy array。
+        对实值序列做 pool, 返回 (1D numpy array, 被替换的 NaN/Inf 值个数)。
+
+        为何要主动处理 NaN:
+          MAC 数据集中 mm_feat0_seq / mm_feat1_seq 是真实多模态特征,
+          原始数据中存在 NaN。若不处理, 平均池化后 NaN 会传染整个样本的
+          embedding, 前向后 loss=NaN, sklearn 验证时抛
+          "Input contains NaN" 直接崩溃。
+
+        替换策略: NaN → 0, +Inf → 0, -Inf → 0 (nan_to_num 默认行为)。
 
         支持:
           1D 列表 [f1, f2, ...]        → 标量 (shape (1,))
           2D 列表 [[..], [..], ...]    → 沿 axis=0 pool (shape (inner_dim,))
         """
         if seq is None or len(seq) == 0:
-            return np.zeros(1, dtype=np.float32)
+            return np.zeros(1, dtype=np.float32), 0
 
         arr = np.asarray(seq, dtype=np.float32)
 
+        # 先清理 NaN/Inf, 再池化 (顺序不能反, 否则 NaN 会污染 pool 结果)
+        n_bad = int(np.count_nonzero(~np.isfinite(arr)))
+        if n_bad:
+            arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
         if arr.ndim == 1:
             if self.seq_pool_mode == "max":
-                return np.array([arr.max()], dtype=np.float32)
-            if self.seq_pool_mode == "sum":
-                return np.array([arr.sum()], dtype=np.float32)
-            return np.array([arr.mean()], dtype=np.float32)
+                out = np.array([arr.max()], dtype=np.float32)
+            elif self.seq_pool_mode == "sum":
+                out = np.array([arr.sum()], dtype=np.float32)
+            else:
+                out = np.array([arr.mean()], dtype=np.float32)
+            return out, n_bad
 
         # arr.ndim >= 2: 沿第 0 维 pool
         if self.seq_pool_mode == "max":
-            return arr.max(axis=0).astype(np.float32).reshape(-1)
-        if self.seq_pool_mode == "sum":
-            return arr.sum(axis=0).astype(np.float32).reshape(-1)
-        return arr.mean(axis=0).astype(np.float32).reshape(-1)
+            out = arr.max(axis=0).astype(np.float32).reshape(-1)
+        elif self.seq_pool_mode == "sum":
+            out = arr.sum(axis=0).astype(np.float32).reshape(-1)
+        else:
+            out = arr.mean(axis=0).astype(np.float32).reshape(-1)
+        return out, n_bad
 
     def __iter__(self):
         n = 0
@@ -342,15 +388,31 @@ class MACIterableDataset(IterableDataset):
                 f: [str(v) for v in (row.get(f) or [])] for f in SEQ_ID_FIELDS
             }
 
-            # mm_feat 实值序列 → pool → concat
+            # mm_feat 实值序列 → pool → concat (同时累计 NaN 统计)
             mm_parts = []
+            sample_bad = 0
             for f in SEQ_FLOAT_FIELDS:
-                mm_parts.append(self._pool_float_seq(row.get(f)))
+                pooled, bad = self._pool_float_seq(row.get(f))
+                mm_parts.append(pooled)
+                sample_bad += bad
 
             if mm_parts:
                 mm_feats = np.concatenate(mm_parts).astype(np.float32)
             else:
                 mm_feats = np.zeros(1, dtype=np.float32)
+
+            # 池化后二次清理: 极端情况下上游全 NaN 或 sum overflow 可能残留 NaN
+            if not np.isfinite(mm_feats).all():
+                mm_feats = np.nan_to_num(mm_feats, nan=0.0, posinf=0.0, neginf=0.0)
+                sample_bad = max(sample_bad, 1)
+
+            # 累计 NaN 统计, 每 _nan_warn_interval 样本汇报一次
+            self._nan_total_samples += 1
+            if sample_bad > 0:
+                self._nan_bad_values += sample_bad
+                self._nan_bad_samples += 1
+            if self._nan_total_samples % self._nan_warn_interval == 0:
+                self._maybe_warn_nan()
 
             # 维度对齐: 不同样本 mm_feat 长度可能不一致 (缺失/变长),
             # 统一 pad/truncate 到 mm_feat_dim, 否则 collate 时 np.stack 会报错
@@ -360,7 +422,12 @@ class MACIterableDataset(IterableDataset):
                 fixed[:n] = mm_feats[:n]
                 mm_feats = fixed
 
-            raw_label = float(row.get(self.label_field) or 0.0)
+            raw_label = row.get(self.label_field)
+            # 标签本身也可能是 NaN (数据缺失)
+            if raw_label is None or not (isinstance(raw_label, (int, float))
+                                          and np.isfinite(raw_label)):
+                raw_label = 0.0
+            raw_label = float(raw_label)
             label = self._transform_label(raw_label)
 
             yield {

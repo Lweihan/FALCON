@@ -30,6 +30,37 @@ def _as_1d(x, name: str = "array") -> np.ndarray:
     return arr
 
 
+def _finite_pair(y_true, y_pred, name: str = "metric"):
+    """
+    联合过滤 y_true / y_pred 中的 NaN / Inf, 返回 (yt, yp, dropped_count)。
+
+    为何要联合过滤:
+      任一侧 NaN/Inf 都会污染指标 (sklearn 直接抛 "Input contains NaN")。
+      联合 mask 保证下标对齐, 避免 y_true[i] 与 y_pred[j] 错位。
+
+    用途:
+      compute_auc / compute_mse / compute_pearson 等入口都调用一次,
+      作为最后一道防线 (数据入口和训练循环已各有一道 NaN 防御)。
+    """
+    yt = _as_1d(y_true, f"{name}.y_true")
+    yp = _as_1d(y_pred, f"{name}.y_pred")
+
+    if yt.shape != yp.shape:
+        raise ValueError(f"y_true/y_pred 形状不一致: {yt.shape} vs {yp.shape}")
+
+    mask = np.isfinite(yt) & np.isfinite(yp)
+    dropped = int(mask.size - mask.sum())
+    if dropped:
+        ratio = dropped / max(mask.size, 1)
+        level = "warning" if ratio > 0.001 else "debug"   # 千分之一以上告警
+        msg = (f"[{name}] 过滤 {dropped}/{mask.size} 个 NaN/Inf 对 "
+               f"({ratio:.2%}); 已扣除后计算指标")
+        (logger.warning if level == "warning" else logger.debug)(msg)
+        yt = yt[mask]
+        yp = yp[mask]
+    return yt, yp, dropped
+
+
 def is_binary(y_true) -> bool:
     """判断标签是否为二值 (只含 0 和 1)。"""
     arr = _as_1d(y_true)
@@ -58,12 +89,9 @@ def compute_auc(
     Returns:
         AUC; 单一类别 (全正或全负) 时返回 0.5 (AUC 此时无定义)
     """
-    yt = _as_1d(y_true, "y_true")
-    yp = _as_1d(y_pred, "y_pred")
-
-    if yt.shape != yp.shape:
-        raise ValueError(f"y_true/y_pred 形状不一致: {yt.shape} vs {yp.shape}")
+    yt, yp, _ = _finite_pair(y_true, y_pred, name="AUC")
     if yt.size == 0:
+        logger.warning("AUC: 过滤 NaN/Inf 后无有效样本, 返回 0.5")
         return 0.5
 
     if binarize_threshold is not None:
@@ -136,14 +164,21 @@ def compute_gauc(y_true, y_pred, group_ids, binarize_threshold: Optional[float] 
 
     只统计组内同时有正负样本的组 (其余组 AUC 无定义)。
     """
-    yt = _as_1d(y_true)
-    yp = _as_1d(y_pred)
+    yt, yp, _ = _finite_pair(y_true, y_pred, name="GAUC")
     gids = np.asarray(group_ids).reshape(-1)
+    # gids 长度必须与原始长度匹配; _finite_pair 改变了长度, 需同步过滤
+    if gids.size != _as_1d(y_true).size:
+        return 0.0
+    # 重新用 finite mask 过滤 gids (必须重建 mask 保持与 yt/yp 一致)
+    orig_yt = _as_1d(y_true)
+    orig_yp = _as_1d(y_pred)
+    mask = np.isfinite(orig_yt) & np.isfinite(orig_yp)
+    gids = gids[mask]
 
     if binarize_threshold is not None:
         yt = (yt > binarize_threshold).astype(np.float64)
 
-    if yt.size == 0 or gids.size != yt.size:
+    if yt.size == 0:
         return 0.0
 
     total_weighted, total_n = 0.0, 0
@@ -165,8 +200,8 @@ def compute_logloss(y_true, y_pred, eps: float = 1e-15) -> float:
 
     y_true 支持连续值 [0,1] (软标签交叉熵)。
     """
-    yt = _as_1d(y_true)
-    yp = np.clip(_as_1d(y_pred), eps, 1.0 - eps)
+    yt, yp, _ = _finite_pair(y_true, y_pred, name="LogLoss")
+    yp = np.clip(yp, eps, 1.0 - eps)
     if yt.size == 0:
         return 0.0
     return float(-np.mean(yt * np.log(yp) + (1 - yt) * np.log(1 - yp)))
@@ -202,13 +237,13 @@ def compute_ndcg(y_true, y_pred, k: int = 10) -> float:
 
 def compute_mse(y_true, y_pred) -> float:
     """均方误差"""
-    yt, yp = _as_1d(y_true), _as_1d(y_pred)
+    yt, yp, _ = _finite_pair(y_true, y_pred, name="MSE")
     return float(np.mean((yt - yp) ** 2)) if yt.size else 0.0
 
 
 def compute_mae(y_true, y_pred) -> float:
     """平均绝对误差"""
-    yt, yp = _as_1d(y_true), _as_1d(y_pred)
+    yt, yp, _ = _finite_pair(y_true, y_pred, name="MAE")
     return float(np.mean(np.abs(yt - yp))) if yt.size else 0.0
 
 
@@ -218,7 +253,7 @@ def compute_pearson(y_true, y_pred) -> float:
 
     标签或预测方差为 0 时返回 0.0 (相关系数无定义)。
     """
-    yt, yp = _as_1d(y_true), _as_1d(y_pred)
+    yt, yp, _ = _finite_pair(y_true, y_pred, name="Pearson")
     if yt.size < 2:
         return 0.0
     std_t, std_p = yt.std(), yp.std()
@@ -234,7 +269,7 @@ def compute_spearman(y_true, y_pred) -> float:
 
     无 scipy 时用 np.argsort 计算秩 (并列取平均秩)。
     """
-    yt, yp = _as_1d(y_true), _as_1d(y_pred)
+    yt, yp, _ = _finite_pair(y_true, y_pred, name="Spearman")
     if yt.size < 2:
         return 0.0
 
