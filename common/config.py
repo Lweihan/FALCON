@@ -87,6 +87,7 @@ class FMConfig:
     pair_mode: str = "last_target"
     use_delta_t_condition: bool = True   # 将真实时间跨度注入网络 (修训推不一致)
     delta_t_from_timestamp: bool = True  # 优先用时间戳算 delta_t, 失败回退步数比例
+    use_data_as_noise: bool = True       # True: source=历史emb(OT-Flow); False: source=Gaussian(标准CFM)
     # ── 数据加载 ──
     num_workers: int = 4
     lazy_load: bool = True          # 懒加载 .pt, 配合 num_workers 并行 IO

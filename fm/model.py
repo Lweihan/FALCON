@@ -53,10 +53,13 @@ class FlowMatchingModel(torch.nn.Module):
         transformer_heads: int = 8,
         transformer_mlp_ratio: float = 4.0,
         transformer_dropout: float = 0.1,
+        # ── Source 分布 ──
+        use_data_as_noise: bool = True,
     ):
         super().__init__()
         self.data_dim = data_dim
         self.backbone_type = backbone_type
+        self.use_data_as_noise = use_data_as_noise
 
         if backbone_type == "dit":
             self.velocity_net = DiTVelocityNetwork(
@@ -135,6 +138,8 @@ class FlowMatchingModel(torch.nn.Module):
             transformer_heads=fm_config.transformer_heads,
             transformer_mlp_ratio=fm_config.transformer_mlp_ratio,
             transformer_dropout=drop if drop is not None else fm_config.transformer_dropout,
+            # Source 分布
+            use_data_as_noise=getattr(fm_config, "use_data_as_noise", True),
         )
 
     @staticmethod
@@ -195,12 +200,21 @@ class FlowMatchingModel(torch.nn.Module):
         """
         Flow Matching 训练损失: w(t) * ||v_pred - v_t||^2
 
+        Source 分布由 use_data_as_noise 控制:
+          True  (推荐): source = condition (历史 embedding)
+                x_t = (1-t)·x_clean + t·condition
+                v_t = condition - x_clean
+                → ODE 从 condition 出发，积分到 x_clean (emb0)
+          False (标准 CFM): source = ε ~ N(0,I)
+                x_t = (1-t)·x_clean + t·ε
+                v_t = ε - x_clean
+
         Args:
-            x_clean: (batch, dim) 目标 embedding
-            condition: (batch, dim) 条件 embedding
-            time_weight_mode: 时间加权策略
+            x_clean:   (batch, dim) 目标 embedding（较新，如 emb0）
+            condition: (batch, dim) 条件 embedding（较旧，如 emb4）
+            time_weight_mode:  时间加权策略
             time_weight_scale: 加权幅度
-            delta_t: (batch,) 真实时间跨度, 注入网络以修复训推不一致
+            delta_t:   (batch,) 真实时间跨度，注入网络修复训推不一致
 
         Returns:
             dict with: loss, mse_raw, mse_weighted, time_weight_mean, t_mean
@@ -209,7 +223,18 @@ class FlowMatchingModel(torch.nn.Module):
         device = x_clean.device
 
         t = torch.rand(batch_size, device=device)
-        noise = torch.randn_like(x_clean)
+
+        if self.use_data_as_noise:
+            # source = condition（历史 embedding），OT-Flow 直线插值
+            # 要求 condition 不为 None
+            if condition is None:
+                raise ValueError(
+                    "use_data_as_noise=True 时 condition 不能为 None"
+                )
+            noise = condition   # shape: (batch, dim)
+        else:
+            noise = torch.randn_like(x_clean)
+
         x_t, v_t = flow_match_forward(x_clean, t, noise)
         v_pred = self.velocity_net(x_t, t, condition, delta_t)
 
@@ -298,8 +323,73 @@ class FlowMatchingModel(torch.nn.Module):
             x_t = x_t - v * dt
         return x_t
 
-    def optimize_embedding(
+    @torch.no_grad()
+    def predict_from_source(
         self,
+        source: torch.Tensor,
+        delta_t: float = 1.0,
+        num_steps: int = 100,
+        method: str = 'euler',
+        inject_delta_t: bool = True,
+    ) -> torch.Tensor:
+        """
+        用历史 embedding 预测当前 embedding（use_data_as_noise=True 专用推理接口）。
+
+        训练时所有配对共享同一条路径定义:
+          x_t = (1-t)·x_clean + t·source,  t ∈ [0,1]
+          x_1 = source（任意历史 emb），x_0 = emb0（目标）
+
+        推理时积分区间始终是 t: 1→0（全程），delta_t 只作为条件信号注入网络，
+        告知模型"这次预测跨越的时间跨度"，不影响积分范围。
+
+          正确: t: 1.0 → 0，步长 dt = 1/num_steps
+          错误: t: delta_t → 0（会漏掉 t>delta_t 的速度场，导致积分不完整）
+
+        Args:
+            source:         (batch, dim) 历史 embedding（emb1/emb2/emb3/emb4 均可）
+            delta_t:        归一化时间跨度，仅作为网络条件注入
+                            (emb1→emb0: 0.25, emb2→emb0: 0.50,
+                             emb3→emb0: 0.75, emb4→emb0: 1.00)
+            num_steps:      ODE 积分步数（越多越精确，验证时默认 10，推理时建议 50+）
+            method:         'euler' | 'rk4'
+            inject_delta_t: 是否将 delta_t 注入网络（需与训练配置保持一致）
+
+        Returns:
+            predicted: (batch, dim) 预测的 emb0
+        """
+        batch_size = source.size(0)
+        device = source.device
+
+        delta_t_tensor = (
+            torch.full((batch_size,), delta_t, device=device) if inject_delta_t else None
+        )
+
+        # 起点：x_1 = source；积分区间始终 t: 1.0 → 0
+        x_t = source.clone()
+        dt = 1.0 / max(num_steps, 1)
+
+        if method == 'euler':
+            for step in range(num_steps):
+                t_val = 1.0 - step * dt                  # t: 1.0 → dt（含起点，不含终点）
+                t = torch.full((batch_size,), t_val, device=device)
+                v = self.velocity_net(x_t, t, source, delta_t_tensor)
+                x_t = x_t - v * dt
+        elif method == 'rk4':
+            for step in range(num_steps):
+                t_val = 1.0 - step * dt
+                t     = torch.full((batch_size,), t_val,        device=device)
+                t_mid = torch.full((batch_size,), t_val - dt/2, device=device)
+                t_end = torch.full((batch_size,), t_val - dt,   device=device)
+                k1 = self.velocity_net(x_t,              t,     source, delta_t_tensor)
+                k2 = self.velocity_net(x_t - dt/2 * k1, t_mid, source, delta_t_tensor)
+                k3 = self.velocity_net(x_t - dt/2 * k2, t_mid, source, delta_t_tensor)
+                k4 = self.velocity_net(x_t - dt   * k3, t_end, source, delta_t_tensor)
+                x_t = x_t - (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+        else:
+            raise ValueError(f"Unknown method: {method}, choose 'euler' or 'rk4'")
+
+        return x_t
+    def optimize_embedding(
         embedding: torch.Tensor,
         delta_t: float = 0.5,
         num_steps: int = 10,

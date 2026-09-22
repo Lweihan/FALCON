@@ -8,14 +8,20 @@ convert_emb_data.py — 将预计算 embedding 转换为 FM 训练所需的 .pt 
     data_dir/
       20240101.parquet    ← 文件名即日期，列: user_id + 1 个 embedding 列
       20240102.parquet
-      20240103.parquet
-      20240104.parquet
-      20240105.parquet
-    脚本自动按文件名排序、提取日期作为 times、按 user_id join 拼出时间序列。
+      ...
+    脚本自动按文件名升序排序（旧→新），提取日期作为 times，按 user_id join。
 
-  ② 单文件模式 (--input)      ← 兼容旧格式
+  ② 单文件模式 (--input)      ← 当天 + 历史多快照合并在一个文件
     列: user_id, emb0, emb1, emb2, emb3, emb4
-    emb0–emb4 对应 5 个时间步的 embedding。
+    其中:
+      emb0 = 当天 (day  0)
+      emb1 = 7 天前 (day -7)
+      emb2 = 14 天前 (day -14)
+      emb3 = 21 天前 (day -21)
+      emb4 = 28 天前 (day -28)
+    ⚠️  列在 DataFrame 中是"从新到旧"，脚本会自动反转为时间升序（旧→新）
+        保存到 .pt，times = ["-28d", "-21d", "-14d", "-7d", "0d"]。
+        FM 训练要求序列从旧到新，condition=早期步，x_clean=较晚步。
 
 输出 (两种模式相同):
   output_dir/
@@ -57,8 +63,14 @@ from common.logger import get_logger
 
 logger = get_logger("convert_emb_data")
 
-# 单文件模式的默认 emb 列名
-_SINGLE_FILE_EMB_COLS = ["emb0", "emb1", "emb2", "emb3", "emb4"]
+# 单文件模式：DataFrame 列顺序（新→旧）
+# emb0=今天, emb1=-7d, emb2=-14d, emb3=-21d, emb4=-28d
+_SINGLE_FILE_EMB_COLS_RAW = ["emb0", "emb1", "emb2", "emb3", "emb4"]
+
+# 反转后的时间序列顺序（旧→新），与 FM 训练语义一致
+# condition = 早期 embedding，x_clean = 较晚 embedding
+_SINGLE_FILE_EMB_COLS = list(reversed(_SINGLE_FILE_EMB_COLS_RAW))   # [emb4, emb3, emb2, emb1, emb0]
+_SINGLE_FILE_TIMES    = ["-28d", "-21d", "-14d", "-7d", "0d"]        # 与上面对应
 
 # 文件夹模式支持的扩展名
 _SUPPORTED_EXTS = (".parquet", ".pkl", ".pickle", ".csv")
@@ -350,26 +362,44 @@ def convert_from_file(
     """
     单文件模式主流程（user_id + emb0…embN）。
 
+    DataFrame 列顺序为"新→旧"（emb0=今天, emb4=28天前），
+    本函数默认将其反转为"旧→新"后保存，与 FM 训练语义对齐：
+        condition = 较早 embedding，x_clean = 较晚 embedding。
+
     Returns:
         (emb_dim, success_count)
     """
     df = _load_file(input_path)
     logger.info(f"加载完成: {len(df)} 行, 列: {list(df.columns)}")
 
-    # 自动推断 emb 列
+    # 默认：使用反转后的列顺序（旧→新）
     if emb_cols is None:
-        emb_cols = [c for c in df.columns if c != "user_id"]
-        if not emb_cols:
-            raise ValueError("单文件中未找到 user_id 以外的列")
-        logger.info(f"自动检测到 emb 列: {emb_cols}")
+        # 若文件包含标准 emb0–emb4 列，按约定反转；否则取 user_id 之外全部列（不反转）
+        has_standard = all(c in df.columns for c in _SINGLE_FILE_EMB_COLS_RAW)
+        if has_standard:
+            emb_cols = _SINGLE_FILE_EMB_COLS   # [emb4, emb3, emb2, emb1, emb0]
+            logger.info(
+                f"检测到标准 emb0–emb4 列，已自动反转为时间升序: {emb_cols}"
+            )
+        else:
+            emb_cols = [c for c in df.columns if c != "user_id"]
+            if not emb_cols:
+                raise ValueError("单文件中未找到 user_id 以外的列")
+            logger.info(f"自动检测到 emb 列: {emb_cols}")
 
     missing = [c for c in ["user_id"] + emb_cols if c not in df.columns]
     if missing:
         raise ValueError(f"DataFrame 缺少必要列: {missing}")
 
     T = len(emb_cols)
+
+    # times：优先外部传入，其次用标准相对天数，最后 fallback 到 day0...dayN
     if times is None:
-        times = [f"day{i}" for i in range(T)]
+        if emb_cols == _SINGLE_FILE_EMB_COLS:
+            times = _SINGLE_FILE_TIMES   # ["-28d", "-21d", "-14d", "-7d", "0d"]
+            logger.info(f"使用标准相对日期 times: {times}")
+        else:
+            times = [f"day{i}" for i in range(T)]
     if len(times) != T:
         raise ValueError(f"times 长度 ({len(times)}) 必须与 emb 列数 ({T}) 一致")
 

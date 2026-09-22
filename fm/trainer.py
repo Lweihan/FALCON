@@ -408,10 +408,9 @@ class FMTrainer:
         """
         验证阶段。
 
-        GPU 利用率优化:
-        - val_ode_steps 控制 ODE 步数 (默认 10, 原 50)
-        - val_max_batches 限制 batch 数
-        - val_compute_cos_sim=False 则完全跳过 ODE, 验证极快
+        cos_sim 计算:
+          use_data_as_noise=True : 调用 predict_from_source(cond → x_clean)
+          use_data_as_noise=False: 调用 predict_future_embedding(旧接口)
         """
         cfg = self.config
         self.model.eval()
@@ -435,13 +434,21 @@ class FMTrainer:
             )
             total_loss += loss_dict["mse_raw"]
 
-            # ODE 求解是串行的, 是验证阶段主要开销
             if cfg.val_compute_cos_sim:
-                mean_dt = float(batch["delta_t"].mean().item()) if "delta_t" in batch else 0.5
-                pred = self.raw_model.predict_future_embedding(
-                    cond, delta_t=mean_dt, num_steps=cfg.val_ode_steps,
-                    inject_delta_t=cfg.use_delta_t_condition,
-                )
+                mean_dt = float(batch["delta_t"].mean().item()) if "delta_t" in batch else 1.0
+                if self.raw_model.use_data_as_noise:
+                    # source = cond（历史 emb），从 cond 积分到 predicted x_clean
+                    pred = self.raw_model.predict_from_source(
+                        cond, delta_t=mean_dt,
+                        num_steps=cfg.val_ode_steps,
+                        inject_delta_t=cfg.use_delta_t_condition,
+                    )
+                else:
+                    pred = self.raw_model.predict_future_embedding(
+                        cond, delta_t=mean_dt,
+                        num_steps=cfg.val_ode_steps,
+                        inject_delta_t=cfg.use_delta_t_condition,
+                    )
                 total_cos += F.cosine_similarity(pred, x_clean, dim=-1).mean().item()
 
             n += 1
