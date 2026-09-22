@@ -118,11 +118,21 @@ def run_fm_stage(config: FALCONConfig, args, embedding_dir: str, device: str = N
             f"请先运行 --stage latent 或指定 --embedding_dir"
         )
 
+    # 外部 val 目录：优先读 CLI 参数，再读配置，再 fallback 到 None
+    val_embedding_dir = getattr(args, "val_embedding_dir", None) or \
+                        getattr(config.pretrain, "val_embedding_dir", None) or None
+    if val_embedding_dir and not os.path.isdir(val_embedding_dir):
+        raise FileNotFoundError(
+            f"验证 Embedding 目录不存在: {val_embedding_dir}"
+        )
+
     if is_main_process():
         logger.info("=" * 70)
         logger.info("Stage 2: FM Teacher 预训练")
         logger.info("=" * 70)
         logger.info(f"  Embedding 目录:  {embedding_dir}")
+        if val_embedding_dir:
+            logger.info(f"  验证集目录:      {val_embedding_dir}")
         logger.info(f"  输出目录:        {fm_output_dir}")
 
     device = device or config.resolve_device()
@@ -131,6 +141,7 @@ def run_fm_stage(config: FALCONConfig, args, embedding_dir: str, device: str = N
         data_dir=embedding_dir,
         output_dir=fm_output_dir,
         train_ratio=config.scenario.train_ratio,
+        val_data_dir=val_embedding_dir,
     )
 
     return fm_output_dir
@@ -223,7 +234,10 @@ GPU 利用率优化示例:
     )
     # 数据路径
     parser.add_argument("--jsonl_path", type=str, default=None, help="用户小传 JSONL 路径")
-    parser.add_argument("--embedding_dir", type=str, default=None, help="Embedding 输出/输入目录")
+    parser.add_argument("--embedding_dir", type=str, default=None, help="Embedding 输出/输入目录 (train)")
+    parser.add_argument("--val_embedding_dir", type=str, default=None,
+                        help="独立验证集 Embedding 目录 (已按时间预分好的 test 目录)；"
+                             "指定后忽略 train_ratio，直接以此目录作为验证集")
     parser.add_argument("--fm_output_dir", type=str, default=None, help="FM checkpoint 目录")
     parser.add_argument("--output_dir", type=str, default=None, help="总输出目录")
     parser.add_argument("--max_users", type=int, default=None, help="限制用户数 (调试)")

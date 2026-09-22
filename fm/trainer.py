@@ -123,7 +123,13 @@ class FMTrainer:
 
     # ── 训练主流程 ──
 
-    def train(self, data_dir: str, output_dir: str, train_ratio: float = 0.8):
+    def train(
+        self,
+        data_dir: str,
+        output_dir: str,
+        train_ratio: float = 0.8,
+        val_data_dir: str = None,
+    ):
         cfg = self.config
 
         if self.is_main:
@@ -145,11 +151,25 @@ class FMTrainer:
             distributed=self.distributed,
         )
         train_loader = create_dataloader(
-            data_dir, split="train", drop_last=self.distributed, **loader_kwargs
+            data_dir, split="train", drop_last=self.distributed,
+            use_all=(val_data_dir is not None),
+            **loader_kwargs,
         )
-        val_loader = create_dataloader(
-            data_dir, split="val", drop_last=False, **loader_kwargs
-        )
+        if val_data_dir is not None:
+            # 外部预分好的 test 目录：全量加载，不 shuffle，不 drop_last
+            val_loader = create_dataloader(
+                val_data_dir, split="val", drop_last=False,
+                use_all=True,
+                **loader_kwargs,
+            )
+            if is_main_process():
+                logger.info(f"验证集使用独立目录: {val_data_dir}")
+        else:
+            val_loader = create_dataloader(
+                data_dir, split="val", drop_last=False,
+                use_all=False,
+                **loader_kwargs,
+            )
 
         n_train, n_val = len(train_loader.dataset), len(val_loader.dataset)
         self._log(f"训练样本对: {n_train}, 验证样本对: {n_val}")

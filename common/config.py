@@ -346,9 +346,10 @@ class PretrainConfig:
     """预训练阶段配置 (Latent 提取 + FM Teacher)"""
     stages: list = field(default_factory=lambda: ["latent", "fm"])
     jsonl_path: str = ""
-    embedding_dir: str = ""     # 空则用 output_dir/embeddings
-    fm_output_dir: str = ""     # 空则用 output_dir/fm_checkpoints
-    resume_from: str = ""       # 断点续训 checkpoint 路径
+    embedding_dir: str = ""          # 空则用 output_dir/embeddings (train)
+    val_embedding_dir: str = ""      # 非空时忽略 train_ratio，直接用此目录作验证集
+    fm_output_dir: str = ""          # 空则用 output_dir/fm_checkpoints
+    resume_from: str = ""            # 断点续训 checkpoint 路径
 
 
 @dataclass

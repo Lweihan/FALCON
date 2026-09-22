@@ -102,6 +102,11 @@ class UserEmbeddingDataset(Dataset):
     每个 .pt 内含:
         embeddings: (T, dim) 各时间步融合 embedding
         times:      [str] × T 时间戳
+
+    split 行为:
+        - split="train" / "val": 按 train_ratio 从 data_dir 内部划分（旧行为）
+        - use_all=True: 加载 data_dir 全部文件，忽略 split/train_ratio
+          （适用于已外部预分好 train/test 目录的场景）
     """
 
     def __init__(
@@ -113,6 +118,7 @@ class UserEmbeddingDataset(Dataset):
         delta_t_from_timestamp: bool = True,
         lazy_load: bool = True,
         min_timesteps: int = 2,
+        use_all: bool = False,
     ):
         if pair_mode not in ("last_target", "all_pairs", "adjacent"):
             raise ValueError(
@@ -130,8 +136,12 @@ class UserEmbeddingDataset(Dataset):
         # 排除 fusion_weights.pt 等非用户数据
         all_files = [f for f in all_files if os.path.basename(f).startswith("user_")]
 
-        n_train = int(len(all_files) * train_ratio)
-        files = all_files[:n_train] if split == "train" else all_files[n_train:]
+        if use_all:
+            # 外部已预分好目录，直接加载全部文件
+            files = all_files
+        else:
+            n_train = int(len(all_files) * train_ratio)
+            files = all_files[:n_train] if split == "train" else all_files[n_train:]
 
         # 扫描元信息 (T 和 times)，同时构建配对索引
         self.files: List[str] = []
@@ -157,8 +167,9 @@ class UserEmbeddingDataset(Dataset):
                 logger.debug(f"跳过 {fpath}: {e}")
                 continue
 
+        tag = "all" if use_all else split
         logger.info(
-            f"[{split}] 用户数={len(self.files)}, 样本对数={len(self.pairs)}, "
+            f"[{tag}] 用户数={len(self.files)}, 样本对数={len(self.pairs)}, "
             f"pair_mode={pair_mode}, lazy_load={lazy_load}"
         )
 
@@ -233,15 +244,18 @@ def create_dataloader(
     prefetch_factor: int = 2,
     drop_last: bool = False,
     distributed: bool = False,
+    use_all: bool = False,
 ) -> DataLoader:
     """
     创建 DataLoader。
 
     Args:
-        num_workers: 并行 IO 进程数 (>0 时配合 lazy_load 显著提升吞吐)
-        pair_mode: 配对策略
-        distributed: True 则使用 DistributedSampler (DDP 多卡)
-        drop_last: DDP 下建议 True, 保证各卡 batch 一致
+        num_workers:  并行 IO 进程数 (>0 时配合 lazy_load 显著提升吞吐)
+        pair_mode:    配对策略
+        distributed:  True 则使用 DistributedSampler (DDP 多卡)
+        drop_last:    DDP 下建议 True，保证各卡 batch 一致
+        use_all:      True 则加载 data_dir 全部文件，忽略 split/train_ratio
+                      （搭配外部预分好的 train/test 目录使用）
     """
     dataset = UserEmbeddingDataset(
         data_dir,
@@ -250,6 +264,7 @@ def create_dataloader(
         pair_mode=pair_mode,
         delta_t_from_timestamp=delta_t_from_timestamp,
         lazy_load=lazy_load,
+        use_all=use_all,
     )
 
     sampler = None
