@@ -202,6 +202,7 @@ def convert_from_dir(
     emb_col: Optional[str] = None,
     select_dates: Optional[List[str]] = None,
     min_days: int = 0,
+    shard_mode: bool = True,
     max_users: Optional[int] = None,
     skip_existing: bool = False,
 ) -> Tuple[int, int]:
@@ -231,11 +232,13 @@ def convert_from_dir(
     if has_standard_emb_cols:
         logger.info(
             f"检测到子模式 A：每文件含完整 emb0–emb4 时间序列，"
-            f"共 {len(daily_files)} 个快照文件，逐文件独立转换。"
+            f"共 {len(daily_files)} 个快照文件，"
+            + ("分片模式（推荐）" if shard_mode else "逐用户模式")
         )
         return _convert_dir_mode_a(
             daily_files=daily_files,
             output_dir=output_dir,
+            shard_mode=shard_mode,
             max_users=max_users,
             skip_existing=skip_existing,
         )
@@ -257,22 +260,50 @@ def convert_from_dir(
 def _convert_dir_mode_a(
     daily_files: List[Tuple[str, str]],
     output_dir: str,
+    shard_mode: bool = True,
     max_users: Optional[int] = None,
     skip_existing: bool = False,
 ) -> Tuple[int, int]:
     """
     子模式 A：每个文件自包含完整 emb0–emb4 时间序列，逐文件独立转换。
     列顺序反转（emb4→emb0），times 使用相对天数标签。
-    全局用户索引连续编号（跨文件不重复）。
+
+    shard_mode=True (默认，推荐):
+      每个快照文件 → 一个 shard_XXXXXX.pt，内含该文件全部用户
+      shard 格式: { "embeddings": Tensor(N, 5, dim), "times": [...], "user_ids": [...] }
+      优点: 文件数 = 快照数（49个），Dataset 初始化极快
+
+    shard_mode=False:
+      每用户一个 user_XXXXXX.pt（旧格式，文件数 = 用户数，不推荐大数据量场景）
     """
     os.makedirs(output_dir, exist_ok=True)
     emb_dim = None
-    global_idx = 0
-    total_success = total_error = total_skip = 0
+    total_success = total_error = 0
+    global_user_idx = 0
 
     for snap_idx, (date_str, path) in enumerate(daily_files):
+        shard_path = os.path.join(output_dir, f"shard_{snap_idx:06d}.pt")
+
+        if shard_mode and skip_existing and os.path.exists(shard_path):
+            # 跳过已存在的 shard，但要累加 global_user_idx
+            try:
+                existing = torch.load(shard_path, map_location="cpu", weights_only=False)
+                n_skip = existing["embeddings"].size(0)
+                global_user_idx += n_skip
+                total_success += n_skip
+                logger.info(f"  [{snap_idx+1}/{len(daily_files)}] {date_str}: 跳过已存在 shard ({n_skip} 用户)")
+            except Exception:
+                pass
+            continue
+
         df = _load_file(path)
         logger.info(f"  [{snap_idx+1}/{len(daily_files)}] {date_str}: {len(df)} 用户")
+
+        if max_users is not None and global_user_idx >= max_users:
+            break
+
+        n_this = len(df) if max_users is None else min(max_users - global_user_idx, len(df))
+        df = df.iloc[:n_this]
 
         # 检测 embedding 维度（只需一次）
         if emb_dim is None:
@@ -282,25 +313,15 @@ def _convert_dir_mode_a(
                     logger.info(f"检测到 embedding 维度: {emb_dim}")
                     break
 
-        n_this = len(df) if max_users is None else min(max_users - global_idx, len(df))
-        if n_this <= 0:
-            break
+        # ── 构建 embeddings Tensor 和 user_ids ──
+        all_embs = []
+        all_uids = []
+        n_err = 0
 
-        pbar = tqdm(total=n_this, desc=f"  {date_str}", unit="用户", leave=False)
-
-        for row_idx in range(n_this):
+        for row_idx in range(len(df)):
             row = df.iloc[row_idx]
             uid = row["user_id"]
-            out_path = os.path.join(output_dir, f"user_{global_idx:06d}.pt")
-
-            if skip_existing and os.path.exists(out_path):
-                total_skip += 1
-                global_idx += 1
-                pbar.update(1)
-                continue
-
             try:
-                # 反转列顺序：emb4(-28d) → emb3 → emb2 → emb1 → emb0(今天)
                 embs = []
                 for col in _SINGLE_FILE_EMB_COLS:   # [emb4, emb3, emb2, emb1, emb0]
                     raw = row[col]
@@ -308,26 +329,42 @@ def _convert_dir_mode_a(
                         embs.append(torch.zeros(emb_dim, dtype=torch.float32))
                     else:
                         embs.append(parse_emb(raw))
-
-                embeddings = torch.stack(embs, dim=0)   # Tensor(5, dim)
-                _save_user_pt(out_path, embeddings, _SINGLE_FILE_TIMES, uid)
-                total_success += 1
-
+                all_embs.append(torch.stack(embs, dim=0))   # (5, dim)
+                all_uids.append(str(uid))
             except Exception as e:
-                total_error += 1
+                n_err += 1
                 logger.debug(f"跳过 date={date_str} row={row_idx} uid={uid}: {e}")
 
-            global_idx += 1
-            pbar.update(1)
+        if not all_embs:
+            logger.warning(f"  [{date_str}] 无有效用户，跳过")
+            continue
 
-        pbar.close()
+        if shard_mode:
+            # ── 保存为单个 shard ──
+            shard_data = {
+                "embeddings": torch.stack(all_embs, dim=0),   # (N, 5, dim)
+                "times":      _SINGLE_FILE_TIMES,              # ["-28d",...,"0d"]
+                "user_ids":   all_uids,                        # list[str] × N
+                "snap_date":  date_str,                        # 快照日期，供溯源
+            }
+            torch.save(shard_data, shard_path)
+            n_saved = len(all_embs)
+            logger.info(f"    → shard_{snap_idx:06d}.pt  ({n_saved} 用户, {n_err} 失败)")
+        else:
+            # ── 逐用户保存（旧格式）──
+            for emb_tensor, uid in zip(all_embs, all_uids):
+                out_path = os.path.join(output_dir, f"user_{global_user_idx:06d}.pt")
+                _save_user_pt(out_path, emb_tensor, _SINGLE_FILE_TIMES, uid)
+                global_user_idx += 1
+            n_saved = len(all_embs)
 
-        if max_users is not None and global_idx >= max_users:
-            break
+        total_success += n_saved
+        total_error   += n_err
+        global_user_idx += n_saved if shard_mode else 0  # shard 模式下 global_user_idx 仅用于 max_users
 
     logger.info(
-        f"子模式 A 转换完成: 成功={total_success}, "
-        f"跳过={total_skip}, 失败={total_error}, 共 {global_idx} 用户"
+        f"子模式 A 转换完成: 成功={total_success}, 失败={total_error}"
+        + (f"  → {len(daily_files)} 个 shard 文件" if shard_mode else "")
     )
     return emb_dim, total_success
 
@@ -458,18 +495,16 @@ def convert_from_file(
     output_dir: str,
     emb_cols: Optional[List[str]] = None,
     times: Optional[List[str]] = None,
+    shard_mode: bool = True,
+    shard_size: int = 50000,
     max_users: Optional[int] = None,
     skip_existing: bool = False,
 ) -> Tuple[int, int]:
     """
     单文件模式主流程（user_id + emb0…embN）。
 
-    DataFrame 列顺序为"新→旧"（emb0=今天, emb4=28天前），
-    本函数默认将其反转为"旧→新"后保存，与 FM 训练语义对齐：
-        condition = 较早 embedding，x_clean = 较晚 embedding。
-
-    Returns:
-        (emb_dim, success_count)
+    shard_mode=True: 按 shard_size 分片存储，每片约 shard_size 个用户
+    shard_mode=False: 每用户一个 user_XXXXXX.pt（旧格式）
     """
     df = _load_file(input_path)
     logger.info(f"加载完成: {len(df)} 行, 列: {list(df.columns)}")
@@ -518,47 +553,88 @@ def convert_from_file(
 
     os.makedirs(output_dir, exist_ok=True)
     total = len(df) if max_users is None else min(max_users, len(df))
-    success = skip_count = error_count = 0
+    success = error_count = 0
 
     pbar = tqdm(total=total, desc="转换 embedding", unit="用户")
 
-    for row_idx in range(total):
-        row = df.iloc[row_idx]
-        uid = row["user_id"]
-        out_path = os.path.join(output_dir, f"user_{row_idx:06d}.pt")
+    if shard_mode:
+        shard_idx = 0
+        shard_embs: List[torch.Tensor] = []
+        shard_uids: List[str] = []
 
-        if skip_existing and os.path.exists(out_path):
-            skip_count += 1
+        def _flush_shard():
+            nonlocal shard_idx
+            if not shard_embs:
+                return
+            shard_path = os.path.join(output_dir, f"shard_{shard_idx:06d}.pt")
+            torch.save({
+                "embeddings": torch.stack(shard_embs, dim=0),
+                "times":      times,
+                "user_ids":   list(shard_uids),
+            }, shard_path)
+            shard_embs.clear()
+            shard_uids.clear()
+            shard_idx += 1
+
+        for row_idx in range(total):
+            row = df.iloc[row_idx]
+            uid = row["user_id"]
+            try:
+                embs = []
+                for col in emb_cols:
+                    raw = row[col]
+                    if raw is None or (isinstance(raw, float) and np.isnan(raw)):
+                        embs.append(torch.zeros(emb_dim, dtype=torch.float32))
+                    else:
+                        embs.append(parse_emb(raw))
+                shard_embs.append(torch.stack(embs, dim=0))
+                shard_uids.append(str(uid))
+                success += 1
+                if len(shard_embs) >= shard_size:
+                    _flush_shard()
+            except Exception as e:
+                error_count += 1
+                logger.debug(f"跳过 row={row_idx} user_id={uid}: {e}")
             pbar.update(1)
-            continue
 
-        try:
-            embs = []
-            for col in emb_cols:
-                raw = row[col]
-                if raw is None or (isinstance(raw, float) and np.isnan(raw)):
-                    embs.append(torch.zeros(emb_dim, dtype=torch.float32))
-                else:
-                    embs.append(parse_emb(raw))
+        _flush_shard()   # 写最后一个不满 shard_size 的分片
 
-            dims = {e.shape[0] for e in embs}
-            if len(dims) > 1:
-                raise ValueError(f"同一用户不同时间步 embedding 维度不一致: {dims}")
+    else:
+        skip_count = 0
+        for row_idx in range(total):
+            row = df.iloc[row_idx]
+            uid = row["user_id"]
+            out_path = os.path.join(output_dir, f"user_{row_idx:06d}.pt")
 
-            embeddings = torch.stack(embs, dim=0)   # (T, dim)
-            _save_user_pt(out_path, embeddings, times, uid)
-            success += 1
+            if skip_existing and os.path.exists(out_path):
+                skip_count += 1
+                pbar.update(1)
+                continue
 
-        except Exception as e:
-            error_count += 1
-            logger.debug(f"跳过 row={row_idx} user_id={uid}: {e}")
+            try:
+                embs = []
+                for col in emb_cols:
+                    raw = row[col]
+                    if raw is None or (isinstance(raw, float) and np.isnan(raw)):
+                        embs.append(torch.zeros(emb_dim, dtype=torch.float32))
+                    else:
+                        embs.append(parse_emb(raw))
 
-        pbar.update(1)
+                dims = {e.shape[0] for e in embs}
+                if len(dims) > 1:
+                    raise ValueError(f"同一用户不同时间步 embedding 维度不一致: {dims}")
+
+                embeddings = torch.stack(embs, dim=0)
+                _save_user_pt(out_path, embeddings, times, uid)
+                success += 1
+            except Exception as e:
+                error_count += 1
+                logger.debug(f"跳过 row={row_idx} user_id={uid}: {e}")
+            pbar.update(1)
 
     pbar.close()
     logger.info(
-        f"转换完成: 成功={success}, 跳过(已存在)={skip_count}, "
-        f"失败={error_count} / 共 {total} 行"
+        f"转换完成: 成功={success}, 失败={error_count} / 共 {total} 行"
     )
     return emb_dim, success
 
@@ -677,6 +753,21 @@ def main():
     parser.add_argument("--skip_existing", action="store_true",
                         help="跳过已存在的 .pt 文件 (断点续转)")
 
+    # ── shard 控制 ──
+    shard_group = parser.add_mutually_exclusive_group()
+    shard_group.add_argument(
+        "--shard", dest="shard_mode", action="store_true", default=True,
+        help="启用 shard 模式（默认）：多用户合并为单个 shard_XXXXXX.pt，大幅减少文件数量",
+    )
+    shard_group.add_argument(
+        "--no_shard", dest="shard_mode", action="store_false",
+        help="禁用 shard 模式：每用户一个 user_XXXXXX.pt（旧格式，适合小规模调试）",
+    )
+    parser.add_argument(
+        "--shard_size", type=int, default=50000,
+        help="单文件模式下每个 shard 包含的用户数（默认 50000；文件夹模式下每个快照=一个 shard，忽略此参数）",
+    )
+
     args = parser.parse_args()
 
     # ── 路由到对应模式 ──
@@ -692,6 +783,7 @@ def main():
             emb_col=args.emb_col,
             select_dates=select_dates,
             min_days=args.min_days,
+            shard_mode=args.shard_mode,
             max_users=args.max_users,
             skip_existing=args.skip_existing,
         )
@@ -711,6 +803,8 @@ def main():
             output_dir=args.output_dir,
             emb_cols=emb_cols,
             times=times,
+            shard_mode=args.shard_mode,
+            shard_size=args.shard_size,
             max_users=args.max_users,
             skip_existing=args.skip_existing,
         )

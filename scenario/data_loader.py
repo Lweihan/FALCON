@@ -3,19 +3,36 @@ data_loader.py — 用户 Embedding 时间序列数据加载
 =================================================
 支持三种配对策略 (pair_mode):
 
-| 模式          | 说明                        | T=4 时样本数 |
+| 模式          | 说明                        | T=5 时样本数 |
 |--------------|----------------------------|------------|
 | last_target  | 随机早期步 → 最后一步 (默认)  | 1          |
-| all_pairs    | 枚举所有 (i,j) i<j          | 6          |
-| adjacent     | 相邻配对 (i, i+1)           | 3          |
+| all_pairs    | 枚举所有 (i,j) i<j          | 10         |
+| adjacent     | 相邻配对 (i, i+1)           | 4          |
 
 同时输出 delta_t (归一化时间跨度)，用于注入网络修复训推不一致:
   - 训练时模型能感知 "预测多远的未来"
   - 推理时 delta_t 语义与训练一致
 
+数据文件格式 (自动检测):
+
+  ① 逐用户格式 (旧格式，user_XXXXXX.pt):
+       { "embeddings": Tensor(T, dim), "times": [...], "user_id": "xxx" }
+     每个用户一个文件，init 时扫描所有文件建索引。
+
+  ② shard 格式 (shard_XXXXXX.pt, 推荐):
+       { "embeddings": Tensor(N, T, dim), "times": [...],
+         "user_ids":   ["uid1", ...],    # 可选
+         "snap_date":  "20240101" }      # 可选，仅快照文件含此字段
+     多用户打包为一个文件，init 时只读元信息（N/T）不加载 embeddings，
+     __getitem__ 时懒加载整个 shard 并按行索引取用户，整个 shard 缓存
+     至下一次加载不同 shard 时替换（单 worker LRU=1；多 worker 每进程独立缓存）。
+
 性能优化:
-  - lazy_load: 只在 __init__ 扫描元信息, __getitem__ 时才 torch.load
-                配合 num_workers>0 实现并行 IO, 避免主进程成为瓶颈
+  - shard 格式: 文件数 = 快照数（如 49），而非用户数（如 1M）；
+    DataLoader init 极快，inode 压力极小。
+  - lazy_load: shard 模式下始终懒加载（每次 __getitem__ 按需加载 shard）；
+    逐用户格式下支持 lazy_load=True（每次加载单文件）/False（init 时全量缓存）。
+  - num_workers>0: 配合 lazy_load 实现并行 IO，避免主进程成为瓶颈。
 """
 
 import os
@@ -99,9 +116,9 @@ class UserEmbeddingDataset(Dataset):
     """
     从预保存的 .pt 文件加载用户 embedding 时间序列。
 
-    每个 .pt 内含:
-        embeddings: (T, dim) 各时间步融合 embedding
-        times:      [str] × T 时间戳
+    自动识别两种文件格式:
+      - shard_XXXXXX.pt   → shard 格式 (推荐，多用户打包)
+      - user_XXXXXX.pt    → 逐用户格式 (旧格式，兼容)
 
     split 行为:
         - split="train" / "val": 按 train_ratio 从 data_dir 内部划分（旧行为）
@@ -130,23 +147,125 @@ class UserEmbeddingDataset(Dataset):
         self.delta_t_from_timestamp = delta_t_from_timestamp
         self.lazy_load = lazy_load
 
-        all_files = sorted(
-            os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith(".pt")
+        # ── 扫描文件，区分 shard / user 两种格式 ──
+        all_shard_files = sorted(
+            os.path.join(data_dir, f)
+            for f in os.listdir(data_dir)
+            if f.startswith("shard_") and f.endswith(".pt")
         )
-        # 排除 fusion_weights.pt 等非用户数据
-        all_files = [f for f in all_files if os.path.basename(f).startswith("user_")]
+        all_user_files = sorted(
+            os.path.join(data_dir, f)
+            for f in os.listdir(data_dir)
+            if f.startswith("user_") and f.endswith(".pt")
+        )
 
+        # 优先使用 shard 格式
+        use_shard = len(all_shard_files) > 0
+        if use_shard and len(all_user_files) > 0:
+            logger.warning(
+                f"目录同时含 shard_*.pt 和 user_*.pt，优先使用 shard 格式 "
+                f"({len(all_shard_files)} 个 shard 文件)"
+            )
+
+        if use_shard:
+            self._init_shard(
+                all_shard_files, split, train_ratio, min_timesteps, use_all
+            )
+        else:
+            self._init_user(
+                all_user_files, split, train_ratio, min_timesteps, use_all
+            )
+
+        tag = "all" if use_all else split
+        logger.info(
+            f"[{tag}] 模式={'shard' if use_shard else 'user'}, "
+            f"用户数={self._n_users}, 样本对数={len(self.pairs)}, "
+            f"pair_mode={pair_mode}"
+        )
+
+    # ── 初始化：shard 格式 ──
+
+    def _init_shard(
+        self,
+        all_files: List[str],
+        split: str,
+        train_ratio: float,
+        min_timesteps: int,
+        use_all: bool,
+    ):
+        """
+        Shard 格式初始化：只读取每个 shard 的元信息（N/T/times），
+        不加载完整的 embeddings Tensor，从而避免 init 时内存峰值。
+
+        pairs 索引: (shard_file_idx, user_within_shard, i, j)
+        """
         if use_all:
-            # 外部已预分好目录，直接加载全部文件
             files = all_files
         else:
             n_train = int(len(all_files) * train_ratio)
             files = all_files[:n_train] if split == "train" else all_files[n_train:]
 
-        # 扫描元信息 (T 和 times)，同时构建配对索引
+        # shard 元信息缓存，延迟加载 embeddings
+        self._shard_files: List[str] = []
+        self._shard_meta: List[dict] = []   # [{N, T, times}, ...]
+        self.pairs: List[Tuple[int, int, int, int]] = []  # (shard_idx, user_in_shard, i, j)
+
+        n_users_total = 0
+
+        for fpath in files:
+            try:
+                # 只加载非 embeddings 字段（times/user_ids/snap_date 都很小）
+                data = torch.load(fpath, map_location="cpu", weights_only=False)
+                emb_tensor = data["embeddings"]  # Tensor(N, T, dim)
+                N, T, _ = emb_tensor.shape
+                if T < min_timesteps:
+                    logger.warning(f"跳过 {fpath}: T={T} < min_timesteps={min_timesteps}")
+                    continue
+
+                times = data.get("times", list(range(T)))
+                shard_idx = len(self._shard_files)
+                self._shard_files.append(fpath)
+                self._shard_meta.append({"N": N, "T": T, "times": times})
+                del data  # 释放，避免 init 阶段内存积压
+
+                # 为该 shard 的每个用户建配对索引
+                for u in range(N):
+                    self.pairs.extend(
+                        (shard_idx, u, i, j)
+                        for i, j in self._iter_pairs(T)
+                    )
+                n_users_total += N
+
+            except Exception as e:
+                logger.debug(f"跳过 {fpath}: {e}")
+                continue
+
+        self._n_users = n_users_total
+        self._is_shard = True
+        # 懒加载缓存：当前已加载的 shard（仅缓存最近一个，多 worker 各自独立）
+        self._cached_shard_idx: int = -1
+        self._cached_shard_emb: Optional[torch.Tensor] = None   # Tensor(N, T, dim)
+
+    # ── 初始化：逐用户格式 ──
+
+    def _init_user(
+        self,
+        all_files: List[str],
+        split: str,
+        train_ratio: float,
+        min_timesteps: int,
+        use_all: bool,
+    ):
+        """逐用户格式（user_XXXXXX.pt）初始化，保持原有行为。"""
+        if use_all:
+            files = all_files
+        else:
+            n_train = int(len(all_files) * train_ratio)
+            files = all_files[:n_train] if split == "train" else all_files[n_train:]
+
         self.files: List[str] = []
         self.times_cache: List[list] = []
-        self.cached_data: List[dict] = []          # 非懒加载模式下缓存完整数据
+        self.cached_data: List[dict] = []     # 非懒加载模式下缓存完整数据
         self.pairs: List[Tuple[int, int, int]] = []  # (file_idx, i, j)
 
         for fpath in files:
@@ -159,49 +278,96 @@ class UserEmbeddingDataset(Dataset):
                 file_idx = len(self.files)
                 self.files.append(fpath)
                 self.times_cache.append(data.get("times", list(range(T))))
-                if not lazy_load:
+                if not self.lazy_load:
                     self.cached_data.append(data)
 
-                self.pairs.extend(self._build_pairs(file_idx, T))
+                self.pairs.extend(
+                    (file_idx, i, j) for i, j in self._iter_pairs(T)
+                )
             except Exception as e:
                 logger.debug(f"跳过 {fpath}: {e}")
                 continue
 
-        tag = "all" if use_all else split
-        logger.info(
-            f"[{tag}] 用户数={len(self.files)}, 样本对数={len(self.pairs)}, "
-            f"pair_mode={pair_mode}, lazy_load={lazy_load}"
-        )
+        self._n_users = len(self.files)
+        self._is_shard = False
 
-    def _build_pairs(self, file_idx: int, T: int) -> List[Tuple[int, int, int]]:
-        """按 pair_mode 构建该用户的配对索引"""
+    # ── 配对迭代器 ──
+
+    def _iter_pairs(self, T: int):
+        """按 pair_mode 返回 (i, j) 索引对"""
         if self.pair_mode == "last_target":
-            # 单条占位, 实际 cond_idx 在 __getitem__ 中随机 (保持原行为)
-            return [(file_idx, -1, T - 1)]
+            # 用 (-1, T-1) 作占位，__getitem__ 中运行时随机采样 i
+            yield -1, T - 1
+        elif self.pair_mode == "all_pairs":
+            for i in range(T - 1):
+                for j in range(i + 1, T):
+                    yield i, j
+        else:  # adjacent
+            for i in range(T - 1):
+                yield i, i + 1
 
-        if self.pair_mode == "all_pairs":
-            return [(file_idx, i, j) for i in range(T - 1) for j in range(i + 1, T)]
+    # ── 数据加载 ──
 
-        # adjacent
-        return [(file_idx, i, i + 1) for i in range(T - 1)]
+    def _load_shard(self, shard_idx: int) -> torch.Tensor:
+        """懒加载 shard embeddings，缓存最近一个"""
+        if self._cached_shard_idx != shard_idx:
+            data = torch.load(
+                self._shard_files[shard_idx],
+                map_location="cpu",
+                weights_only=False,
+            )
+            self._cached_shard_emb = data["embeddings"]   # Tensor(N, T, dim)
+            self._cached_shard_idx = shard_idx
+        return self._cached_shard_emb
 
-    def _load(self, file_idx: int) -> dict:
-        """取用户数据 (懒加载或缓存)"""
+    def _load_user(self, file_idx: int) -> dict:
+        """取用户数据（懒加载或内存缓存）"""
         if self.lazy_load:
-            return torch.load(self.files[file_idx], map_location="cpu", weights_only=False)
+            return torch.load(
+                self.files[file_idx], map_location="cpu", weights_only=False
+            )
         return self.cached_data[file_idx]
+
+    # ── Dataset 接口 ──
 
     def __len__(self) -> int:
         return len(self.pairs)
 
     def __getitem__(self, idx: int) -> dict:
+        if self._is_shard:
+            return self._getitem_shard(idx)
+        else:
+            return self._getitem_user(idx)
+
+    def _getitem_shard(self, idx: int) -> dict:
+        shard_idx, u, i, j = self.pairs[idx]
+        shard_emb = self._load_shard(shard_idx)   # Tensor(N, T, dim)
+        embeddings = shard_emb[u]                  # Tensor(T, dim)
+        times = self._shard_meta[shard_idx]["times"]
+        T = embeddings.size(0)
+
+        if i < 0:
+            i = torch.randint(0, T - 1, (1,)).item() if T > 1 else 0
+
+        condition = embeddings[i].float()
+        x_clean = embeddings[j].float()
+        delta_t = compute_delta_t(times, i, j, self.delta_t_from_timestamp)
+
+        return {
+            "x_clean": x_clean,
+            "condition": condition,
+            "delta_t": delta_t,
+            "step_gap": j - i,
+            "num_timesteps": T,
+        }
+
+    def _getitem_user(self, idx: int) -> dict:
         file_idx, i, j = self.pairs[idx]
-        data = self._load(file_idx)
+        data = self._load_user(file_idx)
         embeddings = data["embeddings"]
         times = self.times_cache[file_idx]
         T = embeddings.size(0)
 
-        # last_target 模式: i = -1 占位, 运行时随机采样条件步
         if i < 0:
             i = torch.randint(0, T - 1, (1,)).item() if T > 1 else 0
 
