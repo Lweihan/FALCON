@@ -196,33 +196,6 @@ def _scan_daily_files(
     return entries
 
 
-def _detect_emb_col(df, date_str: str, emb_col: Optional[str] = None) -> str:
-    """
-    在 daily 文件中自动检测 embedding 列名。
-
-    规则:
-      1. 若指定 --emb_col，直接使用
-      2. 否则取除 user_id 外唯一的非 user_id 列
-      3. 若有多列（如 user_id + emb），取第一个非 user_id 列
-    """
-    if emb_col:
-        if emb_col not in df.columns:
-            raise ValueError(
-                f"[{date_str}] 指定的 --emb_col='{emb_col}' 不在列中: {list(df.columns)}"
-            )
-        return emb_col
-
-    cols = [c for c in df.columns if c != "user_id"]
-    if not cols:
-        raise ValueError(f"[{date_str}] 文件除 user_id 外没有其他列: {list(df.columns)}")
-    if len(cols) > 1:
-        logger.warning(
-            f"[{date_str}] 检测到多个非 user_id 列 {cols}，使用第一列 '{cols[0]}'。\n"
-            f"  若需指定，请使用 --emb_col 参数。"
-        )
-    return cols[0]
-
-
 def convert_from_dir(
     input_dir: str,
     output_dir: str,
@@ -233,18 +206,149 @@ def convert_from_dir(
     skip_existing: bool = False,
 ) -> Tuple[int, int]:
     """
-    文件夹模式主流程。
+    文件夹模式主流程。自动识别两种子结构：
+
+    子模式 A — 每文件已含完整时间序列（emb0–emb4），文件名为快照日期:
+      20260801.parquet: user_id, emb0(今天), emb1(-7d), ..., emb4(-28d)
+      20260808.parquet: user_id, emb0(今天), emb1(-7d), ..., emb4(-28d)
+      → 每个文件独立转换，反转列顺序，times 用相对天数
+
+    子模式 B — 每文件只含单天 embedding，跨文件 join 拼时间序列:
+      20260801.parquet: user_id, emb
+      20260802.parquet: user_id, emb
+      → 跨文件 outer join，文件名日期作为 times
 
     Returns:
         (emb_dim, success_count)
     """
+    daily_files = _scan_daily_files(input_dir, select_dates)
+
+    # ── 自动检测子模式：读第一个文件，看列数 ──
+    first_df = _load_file(daily_files[0][1])
+    non_uid_cols = [c for c in first_df.columns if c != "user_id"]
+    has_standard_emb_cols = all(c in first_df.columns for c in _SINGLE_FILE_EMB_COLS_RAW)
+
+    if has_standard_emb_cols:
+        logger.info(
+            f"检测到子模式 A：每文件含完整 emb0–emb4 时间序列，"
+            f"共 {len(daily_files)} 个快照文件，逐文件独立转换。"
+        )
+        return _convert_dir_mode_a(
+            daily_files=daily_files,
+            output_dir=output_dir,
+            max_users=max_users,
+            skip_existing=skip_existing,
+        )
+    else:
+        logger.info(
+            f"检测到子模式 B：每文件含单天 embedding，"
+            f"共 {len(daily_files)} 个日期文件，跨文件 join 拼接时间序列。"
+        )
+        return _convert_dir_mode_b(
+            daily_files=daily_files,
+            output_dir=output_dir,
+            emb_col=emb_col,
+            min_days=min_days,
+            max_users=max_users,
+            skip_existing=skip_existing,
+        )
+
+
+def _convert_dir_mode_a(
+    daily_files: List[Tuple[str, str]],
+    output_dir: str,
+    max_users: Optional[int] = None,
+    skip_existing: bool = False,
+) -> Tuple[int, int]:
+    """
+    子模式 A：每个文件自包含完整 emb0–emb4 时间序列，逐文件独立转换。
+    列顺序反转（emb4→emb0），times 使用相对天数标签。
+    全局用户索引连续编号（跨文件不重复）。
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    emb_dim = None
+    global_idx = 0
+    total_success = total_error = total_skip = 0
+
+    for snap_idx, (date_str, path) in enumerate(daily_files):
+        df = _load_file(path)
+        logger.info(f"  [{snap_idx+1}/{len(daily_files)}] {date_str}: {len(df)} 用户")
+
+        # 检测 embedding 维度（只需一次）
+        if emb_dim is None:
+            for raw in df[_SINGLE_FILE_EMB_COLS_RAW[0]]:
+                if raw is not None:
+                    emb_dim = parse_emb(raw).shape[0]
+                    logger.info(f"检测到 embedding 维度: {emb_dim}")
+                    break
+
+        n_this = len(df) if max_users is None else min(max_users - global_idx, len(df))
+        if n_this <= 0:
+            break
+
+        pbar = tqdm(total=n_this, desc=f"  {date_str}", unit="用户", leave=False)
+
+        for row_idx in range(n_this):
+            row = df.iloc[row_idx]
+            uid = row["user_id"]
+            out_path = os.path.join(output_dir, f"user_{global_idx:06d}.pt")
+
+            if skip_existing and os.path.exists(out_path):
+                total_skip += 1
+                global_idx += 1
+                pbar.update(1)
+                continue
+
+            try:
+                # 反转列顺序：emb4(-28d) → emb3 → emb2 → emb1 → emb0(今天)
+                embs = []
+                for col in _SINGLE_FILE_EMB_COLS:   # [emb4, emb3, emb2, emb1, emb0]
+                    raw = row[col]
+                    if raw is None or (isinstance(raw, float) and np.isnan(raw)):
+                        embs.append(torch.zeros(emb_dim, dtype=torch.float32))
+                    else:
+                        embs.append(parse_emb(raw))
+
+                embeddings = torch.stack(embs, dim=0)   # Tensor(5, dim)
+                _save_user_pt(out_path, embeddings, _SINGLE_FILE_TIMES, uid)
+                total_success += 1
+
+            except Exception as e:
+                total_error += 1
+                logger.debug(f"跳过 date={date_str} row={row_idx} uid={uid}: {e}")
+
+            global_idx += 1
+            pbar.update(1)
+
+        pbar.close()
+
+        if max_users is not None and global_idx >= max_users:
+            break
+
+    logger.info(
+        f"子模式 A 转换完成: 成功={total_success}, "
+        f"跳过={total_skip}, 失败={total_error}, 共 {global_idx} 用户"
+    )
+    return emb_dim, total_success
+
+
+def _convert_dir_mode_b(
+    daily_files: List[Tuple[str, str]],
+    output_dir: str,
+    emb_col: Optional[str] = None,
+    min_days: int = 0,
+    max_users: Optional[int] = None,
+    skip_existing: bool = False,
+) -> Tuple[int, int]:
+    """
+    子模式 B：每文件单天 embedding，跨文件 outer join 拼出时间序列。
+    文件名日期作为 times（可被 parse_timestamp 解析，delta_t 更精确）。
+    """
     import pandas as pd
 
-    daily_files = _scan_daily_files(input_dir, select_dates)
     T = len(daily_files)
-    times = [d for d, _ in daily_files]     # 日期字符串作为 times（供 delta_t 计算）
+    times = [d for d, _ in daily_files]
 
-    # ── 逐日加载，按 user_id 拼接 ──
     logger.info(f"加载 {T} 个日期文件并按 user_id 合并...")
     merged: Optional[pd.DataFrame] = None
     detected_emb_col: Optional[str] = None
@@ -254,24 +358,27 @@ def convert_from_dir(
         if "user_id" not in df_day.columns:
             raise ValueError(f"[{date_str}] 文件缺少 user_id 列: {path}")
 
-        col = _detect_emb_col(df_day, date_str, emb_col)
-        if detected_emb_col is None:
-            detected_emb_col = col
-        elif col != detected_emb_col:
-            logger.warning(
-                f"[{date_str}] embedding 列名 '{col}' 与首日 '{detected_emb_col}' 不同，"
-                f"以各自列名读取"
+        # 单文件只应有 1 个非 user_id 列
+        cols = [c for c in df_day.columns if c != "user_id"]
+        if emb_col:
+            col = emb_col
+        elif len(cols) == 1:
+            col = cols[0]
+        else:
+            raise ValueError(
+                f"[{date_str}] 子模式 B 期望每文件只有 1 个 embedding 列，"
+                f"实际有 {len(cols)} 列: {cols}。\n"
+                f"  若每文件已含完整 emb0–emb4，请确认列名为标准格式；\n"
+                f"  或通过 --emb_col 指定使用哪一列。"
             )
 
-        # 重命名 emb 列为 emb_{date_str} 避免冲突
+        if detected_emb_col is None:
+            detected_emb_col = col
+
         df_day = df_day[["user_id", col]].rename(columns={col: f"emb_{date_str}"})
-        df_day = df_day.drop_duplicates(subset="user_id")   # 去重，保留首条
+        df_day = df_day.drop_duplicates(subset="user_id")
 
-        if merged is None:
-            merged = df_day
-        else:
-            merged = merged.merge(df_day, on="user_id", how="outer")
-
+        merged = df_day if merged is None else merged.merge(df_day, on="user_id", how="outer")
         logger.info(f"  [{i+1}/{T}] {date_str}: {len(df_day)} 用户，合并后 {len(merged)} 用户")
 
     if merged is None or len(merged) == 0:
@@ -279,17 +386,14 @@ def convert_from_dir(
 
     emb_day_cols = [f"emb_{d}" for d, _ in daily_files]
 
-    # ── min_days 过滤 ──
     if min_days > 0:
-        non_null = merged[emb_day_cols].notna().sum(axis=1)
         before = len(merged)
-        merged = merged[non_null >= min_days]
+        merged = merged[merged[emb_day_cols].notna().sum(axis=1) >= min_days]
         logger.info(f"min_days={min_days} 过滤: {before} → {len(merged)} 用户")
+        if len(merged) == 0:
+            raise ValueError(f"min_days={min_days} 过滤后数据为空")
 
-    if len(merged) == 0:
-        raise ValueError(f"min_days={min_days} 过滤后数据为空，请降低该阈值")
-
-    # ── 检测 embedding 维度 ──
+    # 检测 embedding 维度
     emb_dim = None
     for col in emb_day_cols:
         for val in merged[col]:
@@ -299,10 +403,9 @@ def convert_from_dir(
         if emb_dim:
             break
     if emb_dim is None:
-        raise ValueError("无法从任何列中检测 embedding 维度")
+        raise ValueError("无法检测 embedding 维度")
     logger.info(f"检测到 embedding 维度: {emb_dim}")
 
-    # ── 转换为 .pt ──
     os.makedirs(output_dir, exist_ok=True)
     total = len(merged) if max_users is None else min(max_users, len(merged))
     success = skip_count = error_count = 0
@@ -324,24 +427,23 @@ def convert_from_dir(
             for col in emb_day_cols:
                 val = row[col]
                 if val is None or (isinstance(val, float) and np.isnan(val)):
-                    # 缺失天：填零向量
                     embs.append(torch.zeros(emb_dim, dtype=torch.float32))
                 else:
                     embs.append(parse_emb(val))
 
-            embeddings = torch.stack(embs, dim=0)   # (T, dim)
+            embeddings = torch.stack(embs, dim=0)
             _save_user_pt(out_path, embeddings, times, uid)
             success += 1
 
         except Exception as e:
             error_count += 1
-            logger.debug(f"跳过 row={row_idx} user_id={uid}: {e}")
+            logger.debug(f"跳过 row={row_idx} uid={uid}: {e}")
 
         pbar.update(1)
 
     pbar.close()
     logger.info(
-        f"转换完成: 成功={success}, 跳过(已存在)={skip_count}, "
+        f"子模式 B 转换完成: 成功={success}, 跳过={skip_count}, "
         f"失败={error_count} / 共 {total} 用户"
     )
     return emb_dim, success
