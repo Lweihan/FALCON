@@ -194,7 +194,7 @@ class FMTrainer:
         use_amp = cfg.use_amp and "cuda" in str(self.device)
         scaler = make_grad_scaler(use_amp)
 
-        best_val = float("inf")
+        best_cos = -float("inf")   # 用 val cosine_sim 选最佳 checkpoint（越大越好）
         ema_train = ema_val = None
         alpha = cfg.ema_loss_alpha
         log_history = []
@@ -268,6 +268,8 @@ class FMTrainer:
                 writer.add_scalar("epoch/val_cosine_sim", val_cos, epoch)
                 if ema_val is not None:
                     writer.add_scalar("epoch/ema_val_loss", ema_val, epoch)
+                if cfg.val_compute_cos_sim and val_cos is not None:
+                    writer.add_scalar("epoch/best_val_cos", best_cos, epoch)
 
             log_history.append({
                 "epoch": epoch, "train_loss": train_loss, "ema_train_loss": ema_train,
@@ -280,15 +282,30 @@ class FMTrainer:
 
             # 保存 (仅主进程); 只在有真实验证值时才判断是否为最佳
             if self.is_main:
-                if has_val and ema_val is not None and ema_val < best_val:
-                    best_val = ema_val
-                    save_checkpoint(
-                        os.path.join(output_dir, "best_fm.pt"),
-                        self.raw_model, optimizer,
-                        epoch=epoch, loss=val_loss,
-                        extra={"ema_val_loss": ema_val, "config": vars(cfg)},
-                    )
-                    self._log(f"  * 新最佳 (ema_val={best_val:.6f})")
+                # 以 val_cosine_sim 为准：越大越好
+                # val_compute_cos_sim=False 时 val_cos 为 0.0，降级为 ema_val_loss 保底
+                use_cos = cfg.val_compute_cos_sim and val_cos is not None
+                if has_val:
+                    if use_cos:
+                        is_best = val_cos > best_cos
+                    else:
+                        is_best = (ema_val is not None) and (ema_val < best_cos)
+                    if is_best:
+                        best_cos = val_cos if use_cos else ema_val
+                        save_checkpoint(
+                            os.path.join(output_dir, "best_fm.pt"),
+                            self.raw_model, optimizer,
+                            epoch=epoch, loss=val_loss,
+                            extra={
+                                "val_cos_sim": val_cos,
+                                "ema_val_loss": ema_val,
+                                "config": vars(cfg),
+                            },
+                        )
+                        if use_cos:
+                            self._log(f"  * 新最佳 (val_cos={best_cos:.6f})")
+                        else:
+                            self._log(f"  * 新最佳 (ema_val={best_cos:.6f})")
 
                 if epoch % cfg.save_every == 0:
                     save_checkpoint(
@@ -301,7 +318,10 @@ class FMTrainer:
         if self.is_main:
             with open(os.path.join(output_dir, "fm_train_log.json"), "w") as f:
                 json.dump(log_history, f, indent=2)
-            self._log(f"训练完成, 最佳 ema_val={best_val:.6f}")
+            if cfg.val_compute_cos_sim:
+                self._log(f"训练完成, 最佳 val_cos={best_cos:.6f}")
+            else:
+                self._log(f"训练完成, 最佳 ema_val={best_cos:.6f}")
             self._log(f"TensorBoard: tensorboard --logdir {tb_dir}")
 
     # ── 单 epoch 训练 ──
