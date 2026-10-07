@@ -8,31 +8,34 @@ inference.py — FALCON 端到端推理
   输出: user_id + pred_future_emb（预测的未来 embedding）→ parquet / json / npy
 
   流程: emb0(今天) → predict_from_source(delta_t=1.0) → 预测未来 embedding
-  即模型从 emb0 出发，沿 ODE 积分，预测 28 天后的 embedding 走向。
+
+  特性:
+    - 多卡推理: torchrun --nproc_per_node=N 自动启用，数据按 rank 分片
+    - 断点续推: --resume 跳过已完成的 part 文件，重启后接着跑
+    - 周期保存: 每 --save_every 个 batch 落盘一个 part 文件
+    - tqdm 进度: 仅主进程（rank=0）显示
 
 模式二：单文件模式（已转换 .pt，兼容）
-  --embedding_file  单个 user_XXXXXX.pt 文件推理
-
 模式三：Teacher + Student 端到端推理
-  --lora_path / --jsonl_path
 
 Usage:
-  # 生产模式（最简）
+  # 单卡
   python scripts/inference.py --prod \\
       --fm_checkpoint ./output/fm_checkpoints/best_fm.pt \\
       --input /data/user_emb_20261001.parquet \\
       --output_dir ./inference_output
 
-  # 指定 ODE 步数和输出格式
-  python scripts/inference.py --prod \\
+  # 多卡（4 GPU）
+  torchrun --nproc_per_node=4 scripts/inference.py --prod \\
       --fm_checkpoint ./output/fm_checkpoints/best_fm.pt \\
       --input /data/user_emb_20261001.parquet \\
-      --ode_steps 50 --output_format parquet
+      --output_dir ./inference_output
 
-  # 原有 .pt 文件模式（兼容）
-  python scripts/inference.py \\
+  # 断点续推（上次中断后继续）
+  torchrun --nproc_per_node=4 scripts/inference.py --prod \\
       --fm_checkpoint ./output/fm_checkpoints/best_fm.pt \\
-      --embedding_file ./output/embeddings/user_000000.pt
+      --input /data/user_emb_20261001.parquet \\
+      --output_dir ./inference_output --resume
 """
 
 import sys
@@ -41,9 +44,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import argparse
 import ast
+import glob
 import json
+import math
 import time
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -56,7 +61,48 @@ logger = get_logger(__name__)
 
 
 # ════════════════════════════════════════════════════════════════
-# 工具函数
+# 分布式工具
+# ════════════════════════════════════════════════════════════════
+
+def _get_dist_info() -> Tuple[int, int, int]:
+    """读取 torchrun 注入的环境变量，单进程时默认 rank=0/world_size=1"""
+    rank       = int(os.environ.get("RANK",       0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    return rank, world_size, local_rank
+
+
+def _init_dist(world_size: int):
+    """初始化 NCCL/Gloo 进程组（多卡时）"""
+    if world_size <= 1:
+        return
+    import torch.distributed as dist
+    if dist.is_initialized():
+        return
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    dist.init_process_group(backend=backend)
+
+
+def _barrier(world_size: int):
+    """全局 barrier（多卡时同步）"""
+    if world_size <= 1:
+        return
+    import torch.distributed as dist
+    if dist.is_initialized():
+        dist.barrier()
+
+
+def _cleanup_dist():
+    try:
+        import torch.distributed as dist
+        if dist.is_initialized():
+            dist.destroy_process_group()
+    except Exception:
+        pass
+
+
+# ════════════════════════════════════════════════════════════════
+# 通用工具
 # ════════════════════════════════════════════════════════════════
 
 def _parse_emb(raw) -> Optional[torch.Tensor]:
@@ -103,8 +149,6 @@ def _load_model(ckpt_path: str, config_fm: FMConfig, device: str):
         try:
             fm_cfg = FMConfig(**{k: v for k, v in saved_cfg.items()
                                  if hasattr(FMConfig, k)})
-            logger.info(f"使用 checkpoint 内嵌配置: backbone={fm_cfg.backbone_type}, "
-                        f"dim={fm_cfg.data_dim}")
         except Exception:
             fm_cfg = config_fm
     else:
@@ -116,51 +160,177 @@ def _load_model(ckpt_path: str, config_fm: FMConfig, device: str):
     model.load_state_dict(state, strict=False)
     model.eval()
 
-    epoch = ckpt.get("epoch", "?")
+    epoch   = ckpt.get("epoch", "?")
     val_cos = ckpt.get("extra", {}).get("val_cos_sim", None)
-    logger.info(f"已加载 checkpoint: epoch={epoch}"
-                + (f", val_cos={val_cos:.4f}" if val_cos else ""))
-    return model, fm_cfg
+    return model, fm_cfg, epoch, val_cos
 
 
 # ════════════════════════════════════════════════════════════════
-# 生产模式
+# Part 文件 I/O（用于断点续推）
+# ════════════════════════════════════════════════════════════════
+
+def _part_pattern(output_dir: str, rank: int) -> str:
+    return os.path.join(output_dir, f"_part_rank{rank:04d}_*.parquet")
+
+
+def _part_path(output_dir: str, rank: int, part_idx: int) -> str:
+    return os.path.join(output_dir, f"_part_rank{rank:04d}_{part_idx:06d}.parquet")
+
+
+def _count_resumed_rows(output_dir: str, rank: int) -> Tuple[int, int]:
+    """
+    统计该 rank 已完成的 part 文件行数，用于断点续推。
+
+    Returns:
+        (total_rows_done, next_part_idx)
+    """
+    import pyarrow.parquet as pq
+    parts = sorted(glob.glob(_part_pattern(output_dir, rank)))
+    total = 0
+    for p in parts:
+        try:
+            total += pq.read_metadata(p).num_rows
+        except Exception:
+            pass
+    return total, len(parts)
+
+
+def _flush_part(output_dir: str, rank: int, part_idx: int,
+                user_ids: List[str], pred_matrix: np.ndarray):
+    """将 buffer 写为一个 part parquet 文件"""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    table = pa.table({
+        "user_id":         pa.array(user_ids, type=pa.string()),
+        "pred_future_emb": pa.array(pred_matrix.tolist(),
+                                    type=pa.list_(pa.float32())),
+    })
+    out = _part_path(output_dir, rank, part_idx)
+    pq.write_table(table, out, compression="snappy")
+    return out
+
+
+def _merge_rank_parts(output_dir: str, rank: int) -> str:
+    """合并该 rank 所有 part 文件为单一 shard 文件，删除 parts"""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    parts = sorted(glob.glob(_part_pattern(output_dir, rank)))
+    if not parts:
+        return None
+
+    shard_path = os.path.join(output_dir, f"_shard_rank{rank:04d}.parquet")
+    tables = [pq.read_table(p) for p in parts]
+    merged = pa.concat_tables(tables)
+    pq.write_table(merged, shard_path, compression="snappy")
+
+    for p in parts:
+        os.remove(p)
+    return shard_path
+
+
+def _merge_all_shards(output_dir: str, world_size: int, fmt: str, data_dim: int):
+    """rank 0: 合并所有 rank shard 文件 → 最终输出，删除 shard 临时文件"""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import pandas as pd
+
+    shard_files = sorted(
+        glob.glob(os.path.join(output_dir, "_shard_rank*.parquet"))
+    )
+    if not shard_files:
+        logger.warning("未找到 shard 文件，跳过合并")
+        return
+
+    tables = [pq.read_table(f) for f in shard_files]
+    merged = pa.concat_tables(tables)
+    n = merged.num_rows
+
+    if fmt == "parquet":
+        out_path = os.path.join(output_dir, "pred_future_emb.parquet")
+        pq.write_table(merged, out_path, compression="snappy")
+        logger.info(f"最终输出 parquet: {out_path}  ({n} 行, dim={data_dim})")
+
+    elif fmt == "json":
+        out_path = os.path.join(output_dir, "pred_future_emb.json")
+        df = merged.to_pandas()
+        records = df.to_dict(orient="records")
+        with open(out_path, "w") as f:
+            json.dump(records, f)
+        logger.info(f"最终输出 JSON: {out_path}  ({n} 条)")
+
+    elif fmt == "npy":
+        df = merged.to_pandas()
+        emb_arr = np.array(df["pred_future_emb"].tolist(), dtype=np.float32)
+        uid_list = df["user_id"].tolist()
+        emb_path = os.path.join(output_dir, "pred_future_emb.npy")
+        uid_path = os.path.join(output_dir, "pred_future_emb_uids.json")
+        np.save(emb_path, emb_arr)
+        with open(uid_path, "w") as f:
+            json.dump(uid_list, f)
+        logger.info(f"最终输出 npy: {emb_path}  shape={emb_arr.shape}")
+        logger.info(f"对应 uid: {uid_path}")
+
+    # 清理 shard 临时文件
+    for f in shard_files:
+        os.remove(f)
+
+
+# ════════════════════════════════════════════════════════════════
+# 生产模式主函数
 # ════════════════════════════════════════════════════════════════
 
 def prod_inference(args):
     """
-    生产模式：输入仅需 user_id + emb0（今天的 embedding），
-    预测未来 embedding 并输出。
+    生产模式：输入仅需 user_id + emb0，批量预测未来 embedding。
 
-    训练约定：
-      序列顺序（旧→新）= [emb4(-28d), emb3(-21d), emb2(-14d), emb1(-7d), emb0(今天)]
-      ODE 方向：x_1=旧 → x_0=新；delta_t=1.0 对应跨越全部 4 步（28天）
-
-    推理约定：
-      输入 emb0（今天）作为 source（训练时序列末端），
-      delta_t=1.0 让模型预测"从当前状态出发、28天跨度的未来走向"。
-      输出即为预测的 pred_future_emb。
+    支持：
+      - 多卡（torchrun）：每 rank 处理数据的连续分片，最后 rank 0 合并
+      - 断点续推（--resume）：统计已完成 part 文件行数，跳过对应行继续推理
+      - 周期落盘（--save_every）：每 N 个 batch 写一个 part 文件
+      - tqdm：仅 rank 0 显示，显示该 rank 的用户级别进度
     """
-    if not os.path.exists(args.input):
-        raise FileNotFoundError(f"输入文件不存在: {args.input}")
+    from tqdm import tqdm
+
+    rank, world_size, local_rank = _get_dist_info()
+    is_main = (rank == 0)
+
+    # ── 分布式初始化 ──
+    _init_dist(world_size)
+
+    # ── 设备 ──
+    if world_size > 1 and torch.cuda.is_available():
+        device = f"cuda:{local_rank}"
+    else:
+        cfg_tmp = FALCONConfig.from_yaml(args.config) if os.path.exists(args.config) \
+            else FALCONConfig()
+        device = args.device or cfg_tmp.resolve_device()
 
     config = FALCONConfig.from_yaml(args.config) if os.path.exists(args.config) \
         else FALCONConfig()
-    device = args.device or config.resolve_device()
-    logger.info(f"设备: {device}")
 
-    # ── 加载模型 ──
-    model, fm_cfg = _load_model(args.fm_checkpoint, config.fm, device)
-    data_dim = fm_cfg.data_dim
+    if is_main:
+        logger.info(f"生产推理启动: world_size={world_size}, device={device}")
+
+    # ── 加载模型（每 rank 独立加载，无 DDP wrapper，推理不需要梯度同步）──
+    model, fm_cfg, epoch, val_cos = _load_model(args.fm_checkpoint, config.fm, device)
+    data_dim  = fm_cfg.data_dim
     inject_dt = fm_cfg.use_delta_t_condition
 
-    logger.info(f"推理配置: ode_steps={args.ode_steps}, method={args.ode_method}, "
-                f"delta_t=1.0 (固定), inject_delta_t={inject_dt}")
+    if is_main:
+        logger.info(f"已加载 checkpoint: epoch={epoch}"
+                    + (f", val_cos={val_cos:.4f}" if val_cos else ""))
+        logger.info(f"推理配置: ode_steps={args.ode_steps}, method={args.ode_method}, "
+                    f"delta_t=1.0(固定), inject_delta_t={inject_dt}")
 
     # ── 加载数据 ──
-    logger.info(f"加载数据: {args.input}")
+    if not os.path.exists(args.input):
+        raise FileNotFoundError(f"输入文件不存在: {args.input}")
+
+    if is_main:
+        logger.info(f"加载数据: {args.input}")
     df = _load_file(args.input)
-    logger.info(f"  {len(df)} 用户，列: {list(df.columns)}")
 
     if "user_id" not in df.columns:
         raise ValueError("输入文件缺少 user_id 列")
@@ -169,105 +339,141 @@ def prod_inference(args):
 
     if args.max_users:
         df = df.iloc[:args.max_users]
-        logger.info(f"  限制到 {len(df)} 用户（--max_users）")
 
-    # ── 批量推理 ──
+    N = len(df)
+    if is_main:
+        logger.info(f"  共 {N} 用户，按 {world_size} 个 rank 分片")
+
+    # ── 数据分片：每 rank 取连续子集 ──
+    chunk     = math.ceil(N / world_size)
+    r_start   = rank * chunk
+    r_end     = min(r_start + chunk, N)
+    df_rank   = df.iloc[r_start:r_end].reset_index(drop=True)
+    n_rank    = len(df_rank)
+
     os.makedirs(args.output_dir, exist_ok=True)
-    n = len(df)
-    all_user_ids: List[str] = []
-    all_pred_embs: List[torch.Tensor] = []
+
+    # ── 断点续推：统计已完成 part 文件 ──
+    resume_row = 0
+    next_part  = 0
+    if args.resume:
+        resume_row, next_part = _count_resumed_rows(args.output_dir, rank)
+        if resume_row > 0:
+            logger.info(f"[rank{rank}] 断点续推: 跳过 {resume_row} 行，"
+                        f"已有 {next_part} 个 part 文件")
+        if resume_row >= n_rank:
+            logger.info(f"[rank{rank}] 全部行已完成，跳过推理")
+            _barrier(world_size)
+            if is_main:
+                _finalize(args, world_size, data_dim)
+            _cleanup_dist()
+            return
+    else:
+        # 清理旧 part/shard 文件
+        for old in glob.glob(_part_pattern(args.output_dir, rank)):
+            os.remove(old)
+
+    # ── 推理循环 ──
+    df_todo   = df_rank.iloc[resume_row:].reset_index(drop=True)
+    n_todo    = len(df_todo)
+    batch_size = args.batch_size
+    save_every = max(args.save_every, 1)
+
+    buf_uids: List[str]          = []
+    buf_embs: List[torch.Tensor] = []
+    n_ok = n_skip = 0
+    part_idx = next_part
+
+    # tqdm 仅 rank 0 显示，单位为用户数
+    pbar = tqdm(
+        total=n_todo,
+        desc=f"推理 [rank{rank}]" if world_size > 1 else "推理",
+        unit="用户",
+        disable=not is_main,
+        dynamic_ncols=True,
+        smoothing=0.05,
+    )
 
     t0 = time.time()
-    n_ok = n_skip = 0
 
-    from tqdm import tqdm
+    def _do_flush():
+        nonlocal part_idx, buf_uids, buf_embs
+        if not buf_uids:
+            return
+        mat = torch.stack(buf_embs, dim=0).numpy()
+        part_out = _flush_part(args.output_dir, rank, part_idx, buf_uids, mat)
+        logger.debug(f"[rank{rank}] 落盘 part {part_idx}: {len(buf_uids)} 用户 → {part_out}")
+        part_idx  += 1
+        buf_uids   = []
+        buf_embs   = []
 
-    for batch_start in tqdm(range(0, n, args.batch_size), desc="推理", unit="batch"):
-        batch_df = df.iloc[batch_start: batch_start + args.batch_size]
+    batch_count = 0
+    for batch_start in range(0, n_todo, batch_size):
+        batch_df = df_todo.iloc[batch_start: batch_start + batch_size]
 
-        batch_uids: List[str] = []
-        batch_emb0: List[torch.Tensor] = []
-
+        # 解析 emb0
+        batch_uids: List[str]          = []
+        batch_embs: List[torch.Tensor] = []
         for _, row in batch_df.iterrows():
             emb = _parse_emb(row["emb0"])
-            if emb is None:
-                n_skip += 1
-                continue
-            if emb.shape[0] != data_dim:
-                logger.debug(f"用户 {row['user_id']} 维度不匹配: "
-                             f"{emb.shape[0]} != {data_dim}，跳过")
+            if emb is None or emb.shape[0] != data_dim:
                 n_skip += 1
                 continue
             batch_uids.append(str(row["user_id"]))
-            batch_emb0.append(emb)
+            batch_embs.append(emb)
 
-        if not batch_uids:
-            continue
+        if batch_uids:
+            src = torch.stack(batch_embs, dim=0).to(device)
+            with torch.no_grad():
+                pred = model.predict_from_source(
+                    src,
+                    delta_t=1.0,
+                    num_steps=args.ode_steps,
+                    method=args.ode_method,
+                    inject_delta_t=inject_dt,
+                )
+            buf_uids.extend(batch_uids)
+            buf_embs.extend(pred.cpu().unbind(dim=0))
+            n_ok += len(batch_uids)
 
-        src_tensor = torch.stack(batch_emb0, dim=0).to(device)   # (B, dim)
+        pbar.update(len(batch_df))
+        pbar.set_postfix(ok=n_ok, skip=n_skip, parts=part_idx,
+                         spd=f"{n_ok / max(time.time() - t0, 1e-3):.0f}/s")
 
-        with torch.no_grad():
-            pred = model.predict_from_source(
-                src_tensor,
-                delta_t=1.0,          # emb0 → 未来，跨越完整时间跨度
-                num_steps=args.ode_steps,
-                method=args.ode_method,
-                inject_delta_t=inject_dt,
-            )   # (B, dim)
+        batch_count += 1
+        if batch_count % save_every == 0:
+            _do_flush()
 
-        all_user_ids.extend(batch_uids)
-        all_pred_embs.extend(pred.cpu().unbind(dim=0))
-        n_ok += len(batch_uids)
+    # 最后一批落盘
+    _do_flush()
+    pbar.close()
 
     elapsed = time.time() - t0
-    logger.info(f"推理完成: 成功={n_ok}, 跳过={n_skip}, 耗时={elapsed:.1f}s "
-                f"({n_ok / max(elapsed, 1e-3):.0f} 用户/s)")
+    logger.info(
+        f"[rank{rank}] 推理完成: 成功={n_ok}, 跳过={n_skip}, "
+        f"耗时={elapsed:.1f}s ({n_ok / max(elapsed, 1e-3):.0f} 用户/s), "
+        f"共 {part_idx} 个 part 文件"
+    )
 
-    if not all_pred_embs:
-        logger.error("无有效输出，退出")
-        return
+    # ── 合并本 rank 的 part 文件 ──
+    shard = _merge_rank_parts(args.output_dir, rank)
+    if shard:
+        logger.debug(f"[rank{rank}] part 已合并: {shard}")
 
-    # ── 保存结果 ──
-    pred_matrix = torch.stack(all_pred_embs, dim=0).numpy()   # (N, dim)
-    _save_results(all_user_ids, pred_matrix, args.output_dir, args.output_format, data_dim)
+    # ── 等待所有 rank 完成，rank 0 合并最终输出 ──
+    _barrier(world_size)
+
+    if is_main:
+        _finalize(args, world_size, data_dim)
+
+    _cleanup_dist()
 
 
-def _save_results(
-    user_ids: List[str],
-    pred_matrix: np.ndarray,
-    output_dir: str,
-    fmt: str,
-    data_dim: int,
-):
-    """保存推理结果到指定格式"""
-    if fmt == "parquet":
-        import pandas as pd
-        out_path = os.path.join(output_dir, "pred_future_emb.parquet")
-        out_df = pd.DataFrame({
-            "user_id":        user_ids,
-            "pred_future_emb": [pred_matrix[i].tolist() for i in range(len(user_ids))],
-        })
-        out_df.to_parquet(out_path, index=False)
-        logger.info(f"输出 parquet: {out_path}  ({len(out_df)} 行, dim={data_dim})")
-
-    elif fmt == "json":
-        out_path = os.path.join(output_dir, "pred_future_emb.json")
-        records = [
-            {"user_id": uid, "pred_future_emb": pred_matrix[i].tolist()}
-            for i, uid in enumerate(user_ids)
-        ]
-        with open(out_path, "w") as f:
-            json.dump(records, f)
-        logger.info(f"输出 JSON: {out_path}  ({len(records)} 条)")
-
-    elif fmt == "npy":
-        uid_path = os.path.join(output_dir, "pred_future_emb_uids.json")
-        emb_path = os.path.join(output_dir, "pred_future_emb.npy")
-        np.save(emb_path, pred_matrix)
-        with open(uid_path, "w") as f:
-            json.dump(user_ids, f)
-        logger.info(f"输出 npy: {emb_path}  shape={pred_matrix.shape}")
-        logger.info(f"对应 uid: {uid_path}")
+def _finalize(args, world_size: int, data_dim: int):
+    """rank 0: 合并所有 rank 的 shard → 最终输出文件"""
+    logger.info("合并所有 rank 结果...")
+    _merge_all_shards(args.output_dir, world_size, args.output_format, data_dim)
+    logger.info("全部完成 ✓")
 
 
 # ════════════════════════════════════════════════════════════════
@@ -280,13 +486,15 @@ def fm_inference(args):
         else FALCONConfig()
     device = config.resolve_device()
 
-    model, _ = _load_model(args.fm_checkpoint, config.fm, device)
+    model, fm_cfg, epoch, val_cos = _load_model(args.fm_checkpoint, config.fm, device)
+    logger.info(f"已加载 checkpoint: epoch={epoch}"
+                + (f", val_cos={val_cos:.4f}" if val_cos else ""))
 
     if args.embedding_file:
         data = torch.load(args.embedding_file, map_location="cpu", weights_only=False)
         embeddings = data["embeddings"]
-        times = data["times"]
-        T = embeddings.size(0)
+        times      = data["times"]
+        T          = embeddings.size(0)
         logger.info(f"加载: T={T}, times={times}")
 
         results = []
@@ -380,7 +588,7 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./inference_output",
                         help="输出目录（默认 ./inference_output）")
     parser.add_argument("--device", type=str, default=None,
-                        help="推理设备（默认自动选择 cuda:0 / cpu）")
+                        help="推理设备（单卡时生效；多卡由 torchrun 自动分配）")
 
     # ── 生产模式 ──
     prod = parser.add_argument_group("生产模式 (--prod)  [推荐]")
@@ -399,15 +607,23 @@ def main():
     )
     prod.add_argument(
         "--ode_steps", type=int, default=50,
-        help="[生产模式] ODE 积分步数（默认 50；越多越精确，线性增加耗时）",
+        help="[生产模式] ODE 积分步数（默认 50）",
     )
     prod.add_argument(
         "--ode_method", type=str, default="euler", choices=["euler", "rk4"],
-        help="[生产模式] ODE 方法（默认 euler；rk4 更精确但慢 4x）",
+        help="[生产模式] ODE 方法（默认 euler）",
     )
     prod.add_argument(
         "--batch_size", type=int, default=512,
         help="[生产模式] 推理 batch size（默认 512）",
+    )
+    prod.add_argument(
+        "--save_every", type=int, default=20,
+        help="[生产模式] 每 N 个 batch 写一次 part 文件（断点保存粒度，默认 20）",
+    )
+    prod.add_argument(
+        "--resume", action="store_true",
+        help="[生产模式] 断点续推：跳过已落盘的 part 文件，从中断处继续",
     )
     prod.add_argument(
         "--max_users", type=int, default=None,
@@ -430,7 +646,6 @@ def main():
 
     args = parser.parse_args()
 
-    # ── 路由 ──
     if args.prod:
         if not args.input:
             parser.error("--prod 模式需要指定 --input 文件路径")
@@ -443,4 +658,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
