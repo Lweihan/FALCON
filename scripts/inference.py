@@ -4,10 +4,10 @@ inference.py — FALCON 端到端推理
 ===================================
 
 模式一：生产模式（--prod）[推荐]
-  输入: parquet / csv / pkl，仅需两列: user_id, emb0（今天的 embedding）
+  输入: parquet / csv / pkl，仅需两列: user_id, embedding（今天的 embedding）
   输出: user_id + pred_future_emb（预测的未来 embedding）→ parquet / json / npy
 
-  流程: emb0(今天) → predict_from_source(delta_t=1.0) → 预测未来 embedding
+  流程: embedding(今天) → predict_from_source(delta_t=1.0) → 预测未来 embedding
 
   特性:
     - 多卡推理: torchrun --nproc_per_node=N 自动启用，数据按 rank 分片
@@ -283,7 +283,7 @@ def _merge_all_shards(output_dir: str, world_size: int, fmt: str, data_dim: int)
 
 def prod_inference(args):
     """
-    生产模式：输入仅需 user_id + emb0，批量预测未来 embedding。
+    生产模式：输入仅需 user_id + embedding，批量预测未来 embedding。
 
     支持：
       - 多卡（torchrun）：每 rank 处理数据的连续分片，最后 rank 0 合并
@@ -334,8 +334,8 @@ def prod_inference(args):
 
     if "user_id" not in df.columns:
         raise ValueError("输入文件缺少 user_id 列")
-    if "emb0" not in df.columns:
-        raise ValueError("输入文件缺少 emb0 列（今天的 embedding）")
+    if "embedding" not in df.columns:
+        raise ValueError("输入文件缺少 embedding 列（今天的 embedding）")
 
     if args.max_users:
         df = df.iloc[:args.max_users]
@@ -411,11 +411,11 @@ def prod_inference(args):
     for batch_start in range(0, n_todo, batch_size):
         batch_df = df_todo.iloc[batch_start: batch_start + batch_size]
 
-        # 解析 emb0
+        # 解析 embedding
         batch_uids: List[str]          = []
         batch_embs: List[torch.Tensor] = []
         for _, row in batch_df.iterrows():
-            emb = _parse_emb(row["emb0"])
+            emb = _parse_emb(row["embedding"])
             if emb is None or emb.shape[0] != data_dim:
                 n_skip += 1
                 continue
@@ -594,11 +594,11 @@ def main():
     prod = parser.add_argument_group("生产模式 (--prod)  [推荐]")
     prod.add_argument(
         "--prod", action="store_true",
-        help="启用生产模式：输入仅需 user_id + emb0，预测未来 embedding",
+        help="启用生产模式：输入仅需 user_id + embedding，预测未来 embedding",
     )
     prod.add_argument(
         "--input", type=str, default=None,
-        help="[生产模式] 输入文件路径（parquet / csv / pkl），需含 user_id, emb0 列",
+        help="[生产模式] 输入文件路径（parquet / csv / pkl），需含 user_id, embedding 列",
     )
     prod.add_argument(
         "--output_format", type=str, default="parquet",
