@@ -311,6 +311,7 @@ class FMTrainer:
                     save_checkpoint(
                         os.path.join(output_dir, f"fm_epoch_{epoch}.pt"),
                         self.raw_model, optimizer, epoch=epoch, loss=train_loss,
+                        extra={"config": vars(cfg)},
                     )
             barrier()
 

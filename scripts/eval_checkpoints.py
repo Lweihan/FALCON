@@ -57,39 +57,137 @@ logger = get_logger("eval_checkpoints")
 # Checkpoint 加载
 # ════════════════════════════════════════════════════════════════
 
+def _infer_dit_params_from_state(state: dict) -> Optional[dict]:
+    """
+    从权重 state_dict 的 shape 反推 DiT 超参数（用于旧版无内嵌 config 的 checkpoint）。
+
+    关键 key:
+      velocity_net.blocks.0.attn.qkv.weight  → shape (3*dim, dim)  → dim
+      velocity_net.blocks.*                  → depth（block 数量）
+      velocity_net.patch_embed.weight        → shape (dim, patch_dim) → patch_dim → num_patches
+      velocity_net.cond_embed.0.weight       → shape (dim, cond_dim) → cond_dim / data_dim
+    """
+    try:
+        # 取 dim：从 qkv 权重第一维 / 3
+        qkv_key = "velocity_net.blocks.0.attn.qkv.weight"
+        if qkv_key not in state:
+            return None
+        dit_dim = state[qkv_key].shape[1]          # (3*dim, dim) → dim
+
+        # 取 depth：数 blocks.*
+        depth = sum(1 for k in state if k.startswith("velocity_net.blocks.")
+                    and k.count(".") == 3 and k.endswith(".attn.qkv.weight"))
+
+        # 取 patch_dim：从 patch_embed 权重
+        pe_key = "velocity_net.patch_embed.weight"
+        patch_dim = state[pe_key].shape[1] if pe_key in state else None  # (dim, patch_dim)
+
+        # 取 data_dim / cond_dim：从 cond_embed 的第一层输入维度
+        ce_key = "velocity_net.cond_embed.0.weight"
+        cond_dim = state[ce_key].shape[1] if ce_key in state else 256    # (dim, cond_dim)
+        data_dim = cond_dim  # 通常 data_dim == cond_dim
+
+        # 取 num_patches：从 patch_type_embed shape (1, num_patches, dim)
+        pt_key = "velocity_net.patch_type_embed"
+        num_patches = state[pt_key].shape[1] if pt_key in state else (
+            data_dim // patch_dim if patch_dim else 16
+        )
+
+        # 取 num_heads：从 ada_ln 输出维度 6*dim 无法直接读，改从 q_norm 推断
+        # q_norm 的 weight shape = (head_dim,)，head_dim = dim // num_heads
+        qn_key = "velocity_net.blocks.0.attn.q_norm.weight"
+        if qn_key in state:
+            head_dim = state[qn_key].shape[0]
+            num_heads = dit_dim // head_dim
+        else:
+            num_heads = 16  # 默认
+
+        return {
+            "dit_dim":        dit_dim,
+            "dit_depth":      depth,
+            "dit_heads":      num_heads,
+            "dit_num_patches": num_patches,
+            "data_dim":       data_dim,
+            "cond_dim":       cond_dim,
+        }
+    except Exception as e:
+        logger.debug(f"  反推 DiT 超参失败: {e}")
+        return None
+
+
 def _load_model(ckpt_path: str, config_fm: FMConfig, device: str):
     """
     加载 checkpoint，自动从 extra['config'] 恢复模型超参（可覆盖外部 config）。
+
+    Config 来源优先级（高→低）:
+      1. checkpoint 内嵌的 extra['config']（best_fm.pt 和修复后的 fm_epoch_*.pt 均有）
+      2. 从权重 shape 自动反推 DiT 超参（兼容旧版无内嵌 config 的 checkpoint）
+      3. 外部 --config / FALCONConfig 默认值（最后兜底，可能不匹配）
     """
     from fm.model import FlowMatchingModel
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state = ckpt.get("model_state_dict", ckpt)
+    state = {k.replace("module.", ""): v for k, v in state.items()
+             if not k.startswith("_orig_mod.")}
 
-    # 优先用 checkpoint 内嵌的 FMConfig（避免外部配置与权重不匹配）
+    # ── 1. 优先用 checkpoint 内嵌配置 ──
     saved_cfg = ckpt.get("extra", {}).get("config", None)
     if saved_cfg is not None:
         try:
             fm_cfg = FMConfig(**{k: v for k, v in saved_cfg.items()
                                  if hasattr(FMConfig, k)})
             logger.info(f"  使用 checkpoint 内嵌配置: backbone={fm_cfg.backbone_type}, "
-                        f"dim={fm_cfg.data_dim}, dit_preset={fm_cfg.dit_preset}")
+                        f"data_dim={fm_cfg.data_dim}, dit_preset={fm_cfg.dit_preset}")
         except Exception as e:
-            logger.warning(f"  读取内嵌配置失败 ({e})，使用外部 config")
+            logger.warning(f"  读取内嵌配置失败 ({e})，尝试从权重 shape 反推")
+            saved_cfg = None
+
+    # ── 2. 无内嵌 config：从权重 shape 反推 DiT 超参 ──
+    if saved_cfg is None:
+        inferred = _infer_dit_params_from_state(state)
+        if inferred is not None:
+            import copy
+            fm_cfg = copy.copy(config_fm)
+            fm_cfg.dit_preset = "custom"       # 禁用 preset，使用手动参数
+            fm_cfg.dit_dim        = inferred["dit_dim"]
+            fm_cfg.dit_depth      = inferred["dit_depth"]
+            fm_cfg.dit_heads      = inferred["dit_heads"]
+            fm_cfg.dit_num_patches = inferred["dit_num_patches"]
+            fm_cfg.data_dim       = inferred["data_dim"]
+            fm_cfg.cond_dim       = inferred["cond_dim"]
+            logger.info(
+                f"  从权重 shape 自动反推配置: "
+                f"dim={fm_cfg.dit_dim}, depth={fm_cfg.dit_depth}, "
+                f"heads={fm_cfg.dit_heads}, patches={fm_cfg.dit_num_patches}, "
+                f"data_dim={fm_cfg.data_dim}"
+            )
+        else:
             fm_cfg = config_fm
-    else:
-        fm_cfg = config_fm
+            logger.warning(
+                f"  无法反推超参，使用外部 config（preset={fm_cfg.dit_preset}）。"
+                f"  如出现维度错误，请用 --dit_preset large 等参数手动指定。"
+            )
 
     model = FlowMatchingModel.from_config(fm_cfg, dropout_override=0.0).to(device)
 
-    state = ckpt.get("model_state_dict", ckpt)
-    # 兼容 DDP 保存时带 "module." 前缀
-    state = {k.replace("module.", ""): v for k, v in state.items()
-             if not k.startswith("_orig_mod.")}
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing:
         logger.warning(f"  缺失 key: {missing[:5]}{'...' if len(missing) > 5 else ''}")
     if unexpected:
         logger.warning(f"  多余 key: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
+
+    # 严格检查：关键层 shape 是否匹配，给出明确提示
+    for key in ["velocity_net.blocks.0.attn.qkv.weight",
+                "velocity_net.patch_embed.weight"]:
+        if key in state:
+            ckpt_shape = tuple(state[key].shape)
+            model_param = dict(model.named_parameters()).get(key)
+            if model_param is not None and tuple(model_param.shape) != ckpt_shape:
+                raise RuntimeError(
+                    f"维度不匹配: {key} checkpoint={ckpt_shape} vs model={tuple(model_param.shape)}\n"
+                    f"请检查 --dit_preset / --config 是否与训练时一致。"
+                )
 
     model.eval()
     epoch = ckpt.get("epoch", "?")
@@ -407,6 +505,20 @@ def main():
     parser.add_argument("--output_dir", type=str, default=None,
                         help="评估结果保存目录（JSON + CSV），默认不保存")
 
+    # 模型超参手动覆盖（用于旧版无内嵌 config 的 checkpoint）
+    override_group = parser.add_argument_group(
+        "模型超参覆盖（旧版 checkpoint 无内嵌 config 时使用）"
+    )
+    override_group.add_argument(
+        "--dit_preset", type=str, default=None,
+        choices=["tiny", "small", "base", "large", "xl"],
+        help="手动指定 DiT preset（覆盖 --config 和自动反推，用于无 config 的旧 checkpoint）",
+    )
+    override_group.add_argument(
+        "--data_dim", type=int, default=None,
+        help="手动指定 data_dim（覆盖 --config）",
+    )
+
     args = parser.parse_args()
 
     # ── 配置 ──
@@ -415,6 +527,15 @@ def main():
     else:
         logger.warning(f"配置文件不存在: {args.config}，使用默认配置")
         config = FALCONConfig()
+
+    # ── 手动覆盖 dit_preset / data_dim（旧 checkpoint 无内嵌 config 时使用）──
+    if args.dit_preset is not None:
+        config.fm.dit_preset = args.dit_preset
+        logger.info(f"手动覆盖 dit_preset={args.dit_preset}")
+    if args.data_dim is not None:
+        config.fm.data_dim = args.data_dim
+        config.fm.cond_dim = args.data_dim
+        logger.info(f"手动覆盖 data_dim={args.data_dim}")
 
     device = args.device or config.resolve_device()
     logger.info(f"推理设备: {device}")
