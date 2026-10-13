@@ -74,9 +74,14 @@ def _infer_dit_params_from_state(state: dict) -> Optional[dict]:
             return None
         dit_dim = state[qkv_key].shape[1]          # (3*dim, dim) → dim
 
-        # 取 depth：数 blocks.*
-        depth = sum(1 for k in state if k.startswith("velocity_net.blocks.")
-                    and k.count(".") == 3 and k.endswith(".attn.qkv.weight"))
+        # 取 depth：收集所有 blocks.{idx}.attn.qkv.weight 中的 idx，取最大值+1
+        import re
+        block_indices = set()
+        for k in state:
+            m = re.match(r"velocity_net\.blocks\.(\d+)\.attn\.qkv\.weight", k)
+            if m:
+                block_indices.add(int(m.group(1)))
+        depth = max(block_indices) + 1 if block_indices else 1
 
         # 取 patch_dim：从 patch_embed 权重
         pe_key = "velocity_net.patch_embed.weight"
@@ -228,7 +233,7 @@ def eval_one_checkpoint(
     # 但这里我们需要按固定 source 索引评估，所以直接遍历 shard/user 文件
     dataset = UserEmbeddingDataset(
         data_dir,
-        pair_mode="all_pairs",
+        pair_mode="last_taget",
         use_all=True,
         lazy_load=True,
     )
