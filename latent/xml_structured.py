@@ -130,7 +130,12 @@ def extract_section_text(element: ET.Element) -> str:
 
 
 def parse_profile_xml(xml_str: str) -> dict:
-    """将 XML 字符串解析回 4 个 section 的文本"""
+    """将 XML 字符串解析回 4 个 section 的文本。
+
+    同时支持两种 tag 命名格式:
+      完整格式: static_information / interest_profile / consumption_profile / demand_targets
+      简化格式: static_info       / interest          / consumption          / demand
+    """
     result = {
         'static_information': '',
         'interest_profile': '',
@@ -142,13 +147,21 @@ def parse_profile_xml(xml_str: str) -> dict:
     except ET.ParseError:
         return result
 
-    section_map = {
-        'static_information': 'static_information',
-        'interest_profile': 'interest_profile',
-        'consumption_profile': 'consumption_profile',
-        'demand_targets': 'demand_targets'
-    }
-    for key, tag in section_map.items():
+    # 完整名 → 规范 key；简化名 → 规范 key（后者作为 alias，仅在前者未找到时生效）
+    _ORDERED_CANDIDATES = [
+        # (xml_tag,              output_key)
+        ('static_information',  'static_information'),
+        ('static_info',         'static_information'),   # alias
+        ('interest_profile',    'interest_profile'),
+        ('interest',            'interest_profile'),     # alias
+        ('consumption_profile', 'consumption_profile'),
+        ('consumption',         'consumption_profile'),  # alias
+        ('demand_targets',      'demand_targets'),
+        ('demand',              'demand_targets'),        # alias
+    ]
+    for tag, key in _ORDERED_CANDIDATES:
+        if result[key]:          # 已通过优先 tag 找到，跳过 alias
+            continue
         elem = root.find(tag)
         if elem is not None:
             result[key] = extract_section_text(elem)

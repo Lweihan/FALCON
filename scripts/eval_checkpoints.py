@@ -233,7 +233,7 @@ def eval_one_checkpoint(
     # 但这里我们需要按固定 source 索引评估，所以直接遍历 shard/user 文件
     dataset = UserEmbeddingDataset(
         data_dir,
-        pair_mode="last_taget",
+        pair_mode="last_target",
         use_all=True,
         lazy_load=True,
     )

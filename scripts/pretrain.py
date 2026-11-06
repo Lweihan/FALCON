@@ -48,17 +48,20 @@ logger = get_logger("pretrain")
 
 def run_latent_stage(config: FALCONConfig, args) -> str:
     """
-    JSONL → 融合 embedding 序列。
+    JSONL / Parquet → 融合 embedding 序列。
+
+    若 args.embedding_model 不为空，则进入 Parquet 模式:
+      输入 data_path 为 parquet 文件，含 uid + xml 两列（可含可选时间列）。
+      xml 支持两种 tag 格式: static_information/… 或 static_info/…
+
+    否则进入原有 JSONL 模式:
+      输入 jsonl_path 为 JSONL 文件。
 
     Returns:
         embedding_dir: 输出目录
     """
     import torch
     from latent.pipeline import LatentPipeline
-
-    jsonl_path = args.jsonl_path or config.pretrain.jsonl_path
-    if not jsonl_path:
-        raise ValueError("必须指定 --jsonl_path 或在配置中设置 pretrain.jsonl_path")
 
     embedding_dir = (
         args.embedding_dir
@@ -69,7 +72,6 @@ def run_latent_stage(config: FALCONConfig, args) -> str:
     logger.info("=" * 70)
     logger.info("Stage 1: Latent Clue 提取")
     logger.info("=" * 70)
-    logger.info(f"  输入 JSONL:      {jsonl_path}")
     logger.info(f"  输出目录:        {embedding_dir}")
     logger.info(f"  Embedding 模型:  {config.latent.embed_model_path}")
     logger.info(f"  Embedding 维度:  {config.latent.embed_dim}")
@@ -77,11 +79,44 @@ def run_latent_stage(config: FALCONConfig, args) -> str:
 
     device = config.resolve_device()
     pipeline = LatentPipeline(config.latent, device=device)
-    pipeline.preprocess_jsonl(
-        jsonl_path=jsonl_path,
-        output_dir=embedding_dir,
-        max_users=args.max_users,
-    )
+
+    # ── Parquet 模式 ──────────────────────────────────────────────
+    if args.embedding_model:
+        data_path = args.data_path
+        if not data_path:
+            raise ValueError(
+                "--embedding_model 模式下必须指定 --data_path（parquet 文件路径）"
+            )
+        if not os.path.exists(data_path):
+            raise FileNotFoundError(f"data_path 不存在: {data_path}")
+
+        logger.info(f"  模式:            Parquet（--embedding_model 已指定）")
+        logger.info(f"  输入 Parquet:    {data_path}")
+
+        pipeline.preprocess_parquet(
+            parquet_path=data_path,
+            output_dir=embedding_dir,
+            uid_col=args.uid_col,
+            xml_col=args.xml_col,
+            time_col=args.time_col or None,
+            max_users=args.max_users,
+            shard_size=args.shard_size,
+        )
+
+    # ── JSONL 模式（原有）──────────────────────────────────────────
+    else:
+        jsonl_path = args.jsonl_path or config.pretrain.jsonl_path
+        if not jsonl_path:
+            raise ValueError("必须指定 --jsonl_path 或在配置中设置 pretrain.jsonl_path")
+
+        logger.info(f"  模式:            JSONL（原有流程）")
+        logger.info(f"  输入 JSONL:      {jsonl_path}")
+
+        pipeline.preprocess_jsonl(
+            jsonl_path=jsonl_path,
+            output_dir=embedding_dir,
+            max_users=args.max_users,
+        )
 
     # 保存 fusion 权重 (OPD / Ranker / 推理阶段需要)
     fusion_path = os.path.join(embedding_dir, "fusion_weights.pt")
@@ -153,6 +188,9 @@ def run_fm_stage(config: FALCONConfig, args, embedding_dir: str, device: str = N
 
 def apply_cli_overrides(config: FALCONConfig, args, world_size: int = 1):
     """命令行参数覆盖配置"""
+    # Embedding 模型路径（Parquet 模式下由 --embedding_model 覆盖）
+    if args.embedding_model:
+        config.latent.embed_model_path = args.embedding_model
     # 模型规模
     if args.dit_preset:
         config.fm.dit_preset = args.dit_preset
@@ -233,7 +271,7 @@ GPU 利用率优化示例:
         help="执行阶段: latent(提取) / fm(训练) / all(全部)",
     )
     # 数据路径
-    parser.add_argument("--jsonl_path", type=str, default=None, help="用户小传 JSONL 路径")
+    parser.add_argument("--jsonl_path", type=str, default=None, help="用户小传 JSONL 路径（JSONL 模式）")
     parser.add_argument("--embedding_dir", type=str, default=None, help="Embedding 输出/输入目录 (train)")
     parser.add_argument("--val_embedding_dir", type=str, default=None,
                         help="独立验证集 Embedding 目录 (已按时间预分好的 test 目录)；"
@@ -241,6 +279,44 @@ GPU 利用率优化示例:
     parser.add_argument("--fm_output_dir", type=str, default=None, help="FM checkpoint 目录")
     parser.add_argument("--output_dir", type=str, default=None, help="总输出目录")
     parser.add_argument("--max_users", type=int, default=None, help="限制用户数 (调试)")
+
+    # ── Parquet 模式（--embedding_model 触发）──────────────────────
+    parquet_group = parser.add_argument_group(
+        "Parquet 模式 (--embedding_model 触发)",
+        "当指定 --embedding_model 时进入 Parquet 模式：\n"
+        "  输入为 --data_path 指定的 parquet 文件（uid + xml 两列）\n"
+        "  xml tag 支持完整格式(static_information/…)和简化格式(static_info/…)\n"
+        "示例:\n"
+        "  python scripts/pretrain.py --stage latent \\\n"
+        "      --embedding_model /models/Qwen3-0.6B \\\n"
+        "      --data_path /data/user_profiles.parquet \\\n"
+        "      --embedding_dir ./output/embeddings",
+    )
+    parquet_group.add_argument(
+        "--embedding_model", type=str, default=None,
+        help="Embedding 模型路径（指定后进入 Parquet 模式，同时覆盖 config.latent.embed_model_path）",
+    )
+    parquet_group.add_argument(
+        "--data_path", type=str, default=None,
+        help="[Parquet 模式] 输入 parquet 文件路径（需含 uid + xml 列）",
+    )
+    parquet_group.add_argument(
+        "--uid_col", type=str, default="uid",
+        help="[Parquet 模式] uid 列名（默认 'uid'）",
+    )
+    parquet_group.add_argument(
+        "--xml_col", type=str, default="xml",
+        help="[Parquet 模式] xml 列名（默认 'xml'）",
+    )
+    parquet_group.add_argument(
+        "--time_col", type=str, default=None,
+        help="[Parquet 模式] 时间列名，用于排序同一用户的多快照（默认自动检测 snap_date/date/time/dt/ds）",
+    )
+    parquet_group.add_argument(
+        "--shard_size", type=int, default=50000,
+        help="[Parquet 模式] 每个 shard 文件的最大用户数（默认 50000）",
+    )
+
     # 模型规模
     parser.add_argument(
         "--dit_preset", type=str, default=None,
