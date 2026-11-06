@@ -48,14 +48,14 @@ logger = get_logger("pretrain")
 
 def run_latent_stage(config: FALCONConfig, args) -> str:
     """
-    JSONL / Parquet → 融合 embedding 序列。
+    JSONL / Parquet 目录 → 融合 embedding 序列。
 
-    若 args.embedding_model 不为空，则进入 Parquet 模式:
-      输入 data_path 为 parquet 文件，含 uid + xml 两列（可含可选时间列）。
+    若 args.data_path 不为空，则进入 Parquet 目录模式:
+      data_path 为含 day_xx.parquet 的目录，配合 start_time 推算各文件实际日期。
       xml 支持两种 tag 格式: static_information/… 或 static_info/…
 
     否则进入原有 JSONL 模式:
-      输入 jsonl_path 为 JSONL 文件。
+      jsonl_path 为 JSONL 文件。
 
     Returns:
         embedding_dir: 输出目录
@@ -80,25 +80,27 @@ def run_latent_stage(config: FALCONConfig, args) -> str:
     device = config.resolve_device()
     pipeline = LatentPipeline(config.latent, device=device)
 
-    # ── Parquet 模式 ──────────────────────────────────────────────
-    if args.embedding_model:
-        data_path = args.data_path
-        if not data_path:
-            raise ValueError(
-                "--embedding_model 模式下必须指定 --data_path（parquet 文件路径）"
+    # ── Parquet 目录模式 ──────────────────────────────────────────
+    if args.data_path:
+        if not os.path.isdir(args.data_path):
+            raise NotADirectoryError(
+                f"--data_path 必须是目录（含 day_xx.parquet 文件）: {args.data_path}"
             )
-        if not os.path.exists(data_path):
-            raise FileNotFoundError(f"data_path 不存在: {data_path}")
+        if not args.start_time:
+            raise ValueError(
+                "--data_path 模式下必须指定 --start_time（day_00 对应的日期，格式 YYYYMMDD）"
+            )
 
-        logger.info(f"  模式:            Parquet（--embedding_model 已指定）")
-        logger.info(f"  输入 Parquet:    {data_path}")
+        logger.info(f"  模式:            Parquet 目录")
+        logger.info(f"  输入目录:        {args.data_path}")
+        logger.info(f"  start_time:      {args.start_time}（day_00 对应日期）")
 
         pipeline.preprocess_parquet(
-            parquet_path=data_path,
+            data_dir=args.data_path,
             output_dir=embedding_dir,
+            start_time=args.start_time,
             uid_col=args.uid_col,
             xml_col=args.xml_col,
-            time_col=args.time_col or None,
             max_users=args.max_users,
             shard_size=args.shard_size,
         )
@@ -188,9 +190,6 @@ def run_fm_stage(config: FALCONConfig, args, embedding_dir: str, device: str = N
 
 def apply_cli_overrides(config: FALCONConfig, args, world_size: int = 1):
     """命令行参数覆盖配置"""
-    # Embedding 模型路径（Parquet 模式下由 --embedding_model 覆盖）
-    if args.embedding_model:
-        config.latent.embed_model_path = args.embedding_model
     # 模型规模
     if args.dit_preset:
         config.fm.dit_preset = args.dit_preset
@@ -280,25 +279,27 @@ GPU 利用率优化示例:
     parser.add_argument("--output_dir", type=str, default=None, help="总输出目录")
     parser.add_argument("--max_users", type=int, default=None, help="限制用户数 (调试)")
 
-    # ── Parquet 模式（--embedding_model 触发）──────────────────────
+    # ── Parquet 目录模式（--data_path 触发）────────────────────────
     parquet_group = parser.add_argument_group(
-        "Parquet 模式 (--embedding_model 触发)",
-        "当指定 --embedding_model 时进入 Parquet 模式：\n"
-        "  输入为 --data_path 指定的 parquet 文件（uid + xml 两列）\n"
+        "Parquet 目录模式 (--data_path 触发)",
+        "当指定 --data_path 时进入 Parquet 目录模式：\n"
+        "  data_path 为含 day_xx.parquet 的目录，每文件代表一天的用户 XML 快照\n"
+        "  --start_time 指定 day_00 对应的日期，day_N = start_time - N 天\n"
         "  xml tag 支持完整格式(static_information/…)和简化格式(static_info/…)\n"
         "示例:\n"
         "  python scripts/pretrain.py --stage latent \\\n"
-        "      --embedding_model /models/Qwen3-0.6B \\\n"
-        "      --data_path /data/user_profiles.parquet \\\n"
+        "      --data_path /data/user_xml_dir \\\n"
+        "      --start_time 20261106 \\\n"
         "      --embedding_dir ./output/embeddings",
     )
     parquet_group.add_argument(
-        "--embedding_model", type=str, default=None,
-        help="Embedding 模型路径（指定后进入 Parquet 模式，同时覆盖 config.latent.embed_model_path）",
+        "--data_path", type=str, default=None,
+        help="[Parquet 模式] 含 day_xx.parquet 的目录路径（指定后触发 Parquet 模式）",
     )
     parquet_group.add_argument(
-        "--data_path", type=str, default=None,
-        help="[Parquet 模式] 输入 parquet 文件路径（需含 uid + xml 列）",
+        "--start_time", type=str, default=None,
+        help="[Parquet 模式] day_00 对应的日期（格式 YYYYMMDD / YYYY-MM-DD），"
+             "day_N 对应 start_time - N 天",
     )
     parquet_group.add_argument(
         "--uid_col", type=str, default="uid",
@@ -309,12 +310,8 @@ GPU 利用率优化示例:
         help="[Parquet 模式] xml 列名（默认 'xml'）",
     )
     parquet_group.add_argument(
-        "--time_col", type=str, default=None,
-        help="[Parquet 模式] 时间列名，用于排序同一用户的多快照（默认自动检测 snap_date/date/time/dt/ds）",
-    )
-    parquet_group.add_argument(
         "--shard_size", type=int, default=50000,
-        help="[Parquet 模式] 每个 shard 文件的最大用户数（默认 50000）",
+        help="[Parquet 模式] 每个 shard 文件最大用户数（默认 50000）",
     )
 
     # 模型规模
